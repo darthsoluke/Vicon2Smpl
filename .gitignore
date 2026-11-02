@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+# body model files are licensed separately and must not be committed
+body_models/
+*.pkl
+# capture data / outputs
+*.npz
+*.c3d
+export/
