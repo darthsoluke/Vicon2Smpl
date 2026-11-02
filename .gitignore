@@ -9,3 +9,7 @@ body_models/
 *.npz
 *.c3d
 export/
+runtime/
+*.log
+*.pid
+native/live_markers

@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--calib", required=True)
     ap.add_argument("--model-path", required=True)
     src = ap.add_mutually_exclusive_group()
-    src.add_argument("--host", default="localhost:801", help="Vicon DataStream host:port (801, or 804 for Shogun low-latency)")
+    src.add_argument("--host", default="localhost:801", help="Vicon DataStream host:port (801, or 8802 for newer Shogun Always Live; verify server version)")
     src.add_argument("--replay", default=None, help="play an .npz/.c3d instead of connecting to Vicon")
     ap.add_argument("--subject", default=None)
     ap.add_argument("--up-axis", default="z", choices=["z", "y"])

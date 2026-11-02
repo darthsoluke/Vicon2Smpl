@@ -51,6 +51,19 @@ class BodyModel:
     @classmethod
     def load(cls, model_path, model_type="smpl", gender="neutral", num_betas=10):
         """Load through the `smplx` package (supports .pkl / .npz model files)."""
+        from pathlib import Path
+        if Path(model_path).is_file() and str(model_path).lower().endswith(".npz"):
+            # Geometry-only MoSh support models lack hand PCA metadata required by smplx.create,
+            # even when PCA is disabled. The solver needs only these native FK/LBS arrays.
+            with np.load(model_path, allow_pickle=False) as d:
+                v = d["v_template"]
+                pd = d["posedirs"]
+                if pd.ndim == 3 and pd.shape[:2] == v.shape:
+                    pd = pd.transpose(2, 0, 1)
+                elif pd.ndim == 2:
+                    pd = (pd.T if pd.shape[0] == v.size else pd).reshape(-1, len(v), 3)
+                return cls(v, d["shapedirs"][..., :num_betas], pd, d["J_regressor"],
+                           d["weights"], d["kintree_table"][0].astype(np.int64), d["f"], model_type)
         import smplx
 
         kw = dict(model_type=model_type, gender=gender, num_betas=num_betas)

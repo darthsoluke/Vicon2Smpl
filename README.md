@@ -85,7 +85,8 @@ python run_realtime.py --calib actor1_calib.npz --model-path ./body_models \
     --host 192.168.1.10:801 --subject Actor1 [--udp 127.0.0.1:9763] [--save out.npz]
 ```
 
-- Shogun 用 `--host <ip>:804`（Always Live 低延迟端口）。
+- Shogun 完整人体流使用 `--host <ip>:801`；较新版本的 Always Live 为 `8802`。
+  `804` 在较新 Shogun 中是刚体 ObjectTracker 输出，不能用于全身被试。以现场版本和实际标签为准。
 - 不连 Vicon 也能调试：`--replay calib_take.npz`（或 `.c3d`）按原帧率回放。
 - `--viz none` 关闭可视化；`--spawn-viewer` 自动拉起查看器进程（需同一环境装全 aitviewer）。
 - 每 2 秒打印：求解帧率、耗时、marker 残差、可见 marker 数、被跳过的帧数。求解比采集慢时总是处理**最新帧**，不会积压延迟。
@@ -143,3 +144,34 @@ tests/               合成人体与测试
 ```
 
 SMPL / SMPL-X 模型及其衍生数据受各自许可证约束，请勿提交到仓库（`.gitignore` 已排除 `body_models/`、`*.pkl`、`*.npz`）。
+
+## 浏览器现场测试
+
+`run_web.py` 提供 Viser 网页入口：被试选择、5 秒准备倒计时、T-pose/ROM 采样、
+标定计算、人体与观测/拟合 marker 对照，以及停止后保存参数。
+它独立运行，不调用 Shogun 开拍/停拍、不改正式录制服务或历史原始数据。
+每个人、每次重新贴点都应重新标定；手指效果需要用实际贴点与动作检查。
+
+Linux 使用随官方 SDK 编译的只读 C++ 桥接器，因为官方 Python 二进制包主要面向 Windows。
+SDK、模型与环境不进入 Git。将以下占位路径换成已经检查过的现场安装位置：
+
+```sh
+pip install -r requirements-web.txt
+g++ -O2 -std=c++17 native/live_markers.cpp -I<SDK-header-directory> \
+  -L<SDK-library-directory> -Wl,-rpath,<SDK-library-directory> \
+  -lViconDataStreamSDK_CPP -pthread -o native/live_markers
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python run_web.py \
+  --source <Shogun-IP>:8802 --native-reader ./native/live_markers \
+  --model-path ./body_models --model-type smplx --bind <lab-IP> --port 8792
+```
+
+打开 `http://<lab-IP>:8792`。先在 Shogun 确认正确人物和全身标签，再在网页手动启动标定采样。
+倒计时后 T-pose 保持 3 秒，其余时间做活动范围动作（默认总采样 45 秒）。
+采样结束后点击计算标定，完成后再点击实时拟合。首次初始化与 JIT 编译耗时另计。
+所有现场测试保存在独立 `runtime/<UTC时间_唯一编号>/`：采样 marker、采样时钟、标定、日志、
+拟合序列和 `session.json`。`runtime/status.json` 是当前运行状态，不表示精度验收。
+
+正式数据集接入时，算法结果放入其 `derived/<algorithm>/<run_id>/`，不要替换原始采集入口。
+服务只绑定实验室地址或回环地址；外网查看使用已有 SSH 连接转发，不直接暴露控制页。
+
+现场端口依据：[Shogun 1.14 官方手册](https://help.vicon.com/download/attachments/196380086/Getting%20started%20with%20Vicon%20Shogun.pdf)。
