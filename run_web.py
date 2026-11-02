@@ -49,8 +49,11 @@ class FieldApp:
         self.subject = self.server.gui.add_dropdown("被试", options=("等待被试",))
         self.subject.on_update(self.change_subject)
         with self.server.gui.add_folder("1 · 被试标定", expand_by_default=True):
+            self.pose_kind = self.server.gui.add_dropdown("开头静止姿态", options=("A-pose（手臂斜下）", "T-pose（手臂平举）"))
             self.duration = self.server.gui.add_slider("采样时长 / 秒", min=15, max=90, step=5, initial_value=45)
-            self.server.gui.add_markdown("点击后有 **5 秒准备**。先保持 **T-pose 3 秒**，再做手臂画圈、屈肘、深蹲、转身与抬腿。")
+            self.pose_hint = self.server.gui.add_markdown("")
+            self.pose_kind.on_update(lambda _: self.update_pose_hint())
+            self.update_pose_hint()
             self.capture = self.server.gui.add_button("开始标定采样")
             self.capture.on_click(self.start_sampling)
             self.finish = self.server.gui.add_button("停止采样并保留", disabled=True)
@@ -69,6 +72,26 @@ class FieldApp:
         self.detail = self.server.gui.add_markdown("红点：观测 marker；绿点：拟合 marker。手指质量取决于手部贴点布局。")
         self.server.gui.add_markdown("本页仅采样标定 marker 与保存派生拟合；正式录制仍使用原录制页面。")
         self.server.on_client_connect(lambda event: self.center_view(event))
+        if getattr(args, "calib", None):
+            if not args.subject:
+                raise ValueError("--calib requires --subject to keep the actor association explicit")
+            path = Path(args.calib).resolve()
+            with np.load(path, allow_pickle=False) as d:
+                if "source_subject" not in d or str(d["source_subject"]) != args.subject:
+                    raise ValueError("Saved calibration subject does not match --subject")
+                pose = str(d["static_pose"]) if "static_pose" in d else "t"
+            self.selected, self.run, self.calibration_path = args.subject, path.parent, path
+            self.subject.options = (self.selected,)
+            self.subject.value = self.selected
+            self.pose_kind.value = "A-pose（手臂斜下）" if pose == "a" else "T-pose（手臂平举）"
+            self._load_calibration(path)
+            self.mode = "calibrated"
+            self.track_button.disabled = False
+            self.message = f"已加载 {pose.upper()}-pose 标定候选，等待真人叠加检查。"
+
+    def update_pose_hint(self):
+        name = "A-pose" if self.pose_kind.value.startswith("A") else "T-pose"
+        self.pose_hint.content = f"点击后有 **5 秒准备**。先保持 **{name} 3 秒**，再做活动范围动作或自由活动。"
 
     def _mesh_visibility(self):
         if self.mesh:
@@ -113,6 +136,7 @@ class FieldApp:
                 self.message = "可见 marker 不足或数据过期；请检查 Shogun 的全身标签。"
                 return
             self.mode = "countdown"
+            self.sample_static_pose = "a" if self.pose_kind.value.startswith("A") else "t"
             self.countdown_end = time.perf_counter() + 5
             self.samples = []
             self.run = self.root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8])
@@ -120,7 +144,7 @@ class FieldApp:
             self.recording = self.calibration_path = None
             self.solver = self.rig = None
             self.track_button.disabled = self.fit_button.disabled = self.capture.disabled = True
-            self.subject.disabled = self.duration.disabled = True
+            self.subject.disabled = self.duration.disabled = self.pose_kind.disabled = True
             self.finish.disabled = False
             self.fitted.visible = False
             if self.mesh:
@@ -131,7 +155,7 @@ class FieldApp:
             if self.mode not in ("sampling", "countdown"):
                 return
             self.mode = "preview"
-            self.capture.disabled = self.subject.disabled = self.duration.disabled = False
+            self.capture.disabled = self.subject.disabled = self.duration.disabled = self.pose_kind.disabled = False
             self.finish.disabled = True
             if not self.samples:
                 self.message = "未采到 marker；可重新开始。"
@@ -149,7 +173,8 @@ class FieldApp:
             np.savez_compressed(self.run / "sampling_clock.npz", relative_host_arrival_seconds=times,
                                 source_frame_numbers=frames)
             self._receipt("sampled", source_fps=self.source.frame_rate, sampled_fps=fps,
-                          samples=len(times), tpose_window=list(self.tpose_window), duration_seconds=float(times[-1]))
+                          samples=len(times), tpose_window=list(self.tpose_window), duration_seconds=float(times[-1]),
+                          static_pose=self.sample_static_pose)
             self.fit_button.disabled = times[-1] < 10 or self.tpose_window[1] - self.tpose_window[0] < 5
             self.message = f"已保留 {len(times)} 帧 / {times[-1]:.1f} 秒。" + ("可以计算标定。" if not self.fit_button.disabled else "采样太短，请重新采样。")
 
@@ -166,11 +191,11 @@ class FieldApp:
             if self.mode != "preview" or self.fit_button.disabled:
                 return
             self.mode = "calibrating"
-            self.fit_button.disabled = self.capture.disabled = self.subject.disabled = True
+            self.fit_button.disabled = self.capture.disabled = self.subject.disabled = self.pose_kind.disabled = True
             self.message = "正在计算被试体型与 marker 布局；进度保存在 calibration.log。"
             # Run the existing CLI in a worker process: its CPU work cannot block the browser.
             metadata = self.run / "calibration_request.json"
-            metadata.write_text(json.dumps({"tpose": list(self.tpose_window)}))
+            metadata.write_text(json.dumps({"tpose": list(self.tpose_window), "static_pose": self.sample_static_pose}))
             threading.Thread(target=self._calibrate, daemon=True).start()
 
     def _calibrate(self):
@@ -184,20 +209,20 @@ from vsmpl.sources import load_recording
 model=BodyModel.load(sys.argv[1],sys.argv[2],sys.argv[3])
 rec=load_recording(sys.argv[4])
 window=json.load(open(sys.argv[5]))['tpose']
-result=calibrate(model,rec,tpose=tuple(window))
-np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,**result)
+result=calibrate(model,rec,tpose=tuple(window),static_pose=sys.argv[7])
+np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=sys.argv[8],**result)
 """
         try:
             with (self.run / "calibration.log").open("w") as log:
                 subprocess.run([sys.executable, "-u", "-c", code, self.args.model_path, self.args.model_type,
                                 self.args.gender, str(self.run / "calibration_markers.npz"),
-                                str(self.run / "calibration_request.json"), str(output)],
+                                str(self.run / "calibration_request.json"), str(output), self.sample_static_pose, self.selected],
                                stdout=log, stderr=subprocess.STDOUT, check=True)
             with self.lock:
                 self.calibration_path = output
                 self._load_calibration(output)
                 self.mode = "calibrated"
-                self.message = "标定完成。检查逐点残差后，点击开始实时拟合。"
+                self.message = "标定计算完成，尚待真人叠加检查。请先检查逐点残差和朝向，再开始测试拟合。"
                 self._receipt("calibrated", calibration_file=output.name)
                 self.track_button.disabled = False
         except Exception as e:
@@ -207,19 +232,31 @@ np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,**re
                 self._receipt("calibration_failed", error=str(e))
                 self.fit_button.disabled = False
         finally:
-            self.capture.disabled = self.subject.disabled = False
+            self.capture.disabled = self.subject.disabled = self.pose_kind.disabled = False
 
     def _load_calibration(self, path):
         with np.load(path, allow_pickle=False) as calib:
             self.rig = MarkerRig.from_calibration(self.model, calib)
             residual = calib["per_marker_rms"] * 1000
+            scope = str(calib["marker_scope"]) if "marker_scope" in calib else "all_markers"
         self.solver = RealtimeSolver(self.rig)
         self.mapper = NameMapper(self.rig.names)
         self.detail.content = f"标定 marker {len(residual)} 个；残差中位数 **{np.median(residual):.1f} mm**，最大 **{residual.max():.1f} mm**。请检查明显偏大的点及朝向。"
+        high = [name for name, error in zip(self.rig.names, residual) if error > 30]
+        if high:
+            self.detail.content += "\n\n**候选存在较大残差，尚未验收：** " + "、".join(high)
+        if scope == "body_wrist_only":
+            self.detail.content += "\n\n**此候选仅标定身体与手腕，手指 marker 未参与；手指姿态不代表测量结果。**"
 
     def start_tracking(self, _):
         with self.lock:
             if self.mode != "calibrated" or not self.solver:
+                return
+            _, packet = self.source.snapshot()
+            fr = subject_frame(packet, self.selected) if packet else None
+            mapped_valid = self.mapper(fr)[1] if fr else np.zeros(0, bool)
+            if not fr or time.perf_counter() - packet["arrival_time"] > 1 or mapped_valid.sum() < self.solver.cfg.min_markers:
+                self.message = "当前被试的可见点不足；请就位并恢复 marker 后再开始实时拟合。"
                 return
             self.solver.reset()
             self.recorder = SequenceRecorder(self.args.model_type, self.args.gender, self.rig.betas,
@@ -227,7 +264,7 @@ np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,**re
             self.fit_count = 0
             self.last_result = None
             self.mode = "tracking"
-            self.track_button.disabled = self.capture.disabled = self.subject.disabled = True
+            self.track_button.disabled = self.capture.disabled = self.subject.disabled = self.pose_kind.disabled = True
             self.stop_button.disabled = False
             self.message = "实时拟合中。红点为观测，绿点为拟合。"
             self._receipt("tracking")
@@ -243,7 +280,7 @@ np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,**re
             self.recorder = None
             self.message = f"已停止并保存 {n} 个输出帧。"
             self._receipt("saved", last_solved_file=name if n else None, solved_frames=n)
-            self.track_button.disabled = self.capture.disabled = self.subject.disabled = False
+            self.track_button.disabled = self.capture.disabled = self.subject.disabled = self.pose_kind.disabled = False
             self.stop_button.disabled = True
             self.fitted.visible = False
             if self.mesh:
@@ -306,10 +343,10 @@ np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,**re
                             self.selected = self.subject.value
                         phase = self.message
                         if self.mode == "countdown":
-                            phase = f"准备 T-pose · {max(0, self.countdown_end-now):.0f} 秒"
+                            phase = f"准备 {self.sample_static_pose.upper()}-pose · {max(0, self.countdown_end-now):.0f} 秒"
                         elif self.mode == "sampling":
                             elapsed = now - self.sample_start
-                            phase = f"{'保持 T-pose' if elapsed < 3 else '开始活动范围动作'} · {elapsed:.1f}/{self.duration.value} 秒"
+                            phase = f"{'保持 '+self.sample_static_pose.upper()+'-pose' if elapsed < 3 else '开始活动范围动作'} · {elapsed:.1f}/{self.duration.value} 秒"
                         visible_count = int(fr["valid"].sum()) if fr and age < 1 else 0
                         connection = f"{self.source.frame_rate:.0f} Hz · 数据年龄 {age*1000:.0f} ms" if age < 1 else "等待新数据 · " + self.source.error
                         stats = ""
@@ -344,6 +381,8 @@ def main():
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8792)
     parser.add_argument("--output", default="runtime")
+    parser.add_argument("--calib", help="load a separately reviewed calibration candidate without resampling")
+    parser.add_argument("--subject", help="explicit subject associated with --calib")
     FieldApp(parser.parse_args()).loop()
 
 

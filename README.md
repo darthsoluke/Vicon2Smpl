@@ -70,9 +70,15 @@ python calibrate.py --rec calib_take.npz --model-path ./body_models --model-type
     --gender neutral --tpose 0.3:2.5 --out actor1_calib.npz
 ```
 
-- `--tpose`：静止 T-pose 的时间窗（秒）。
+- `--tpose`：开头静止姿态的时间窗（秒）；参数名为兼容旧调用保留。
+- `--static-pose t|a`：明确静止段是 T-pose 还是 A-pose。A-pose 可加 `--arm-angle 60`
+  指定手臂下垂角的初值；实际关节姿态继续由观测优化。A-pose 的联合标定约束保留已拟合的静止姿态，
+  不会把静止帧拉回 T-pose。后续自由活动可用，但未活动到的关节约束可能不足。
 - `--facing`：T-pose 时被试朝向（SMPL 坐标轴：Vicon +X → +x，Vicon +Y → −z）。默认 `auto` 会对多个朝向假设各跟踪 10 秒 ROM、选残差最小的；输出里出现 "ambiguous" 时手动指定。
 - `--marker-map labels.json`：如果你有 `{marker标签: SMPL顶点id}` 的对应表（例如来自 MoSh++/SOMA 的标记布局），可跳过自动对应。
+- `--marker-regions regions.json`：调用方显式提供 `{标签: [允许的顶点id]}`，可在对应身体部位内寻找实际贴点。
+  此约束贯穿静止拟合、初次对应和两种重新分配；与固定 `--marker-map` 互斥。区域定义属于调用方先验，
+  需要按现场标签和模型核对，不默认把任意名字解释为某个身体部位。
 - 输出会列出残差偏大的 marker（贴错位置/标签错误时会在这里暴露）。
 
 ### 3. 实时运行
@@ -148,7 +154,7 @@ SMPL / SMPL-X 模型及其衍生数据受各自许可证约束，请勿提交到
 ## 浏览器现场测试
 
 `run_web.py` 提供 Viser 网页入口：被试选择、5 秒准备倒计时、T-pose/ROM 采样、
-标定计算、人体与观测/拟合 marker 对照，以及停止后保存参数。
+标定计算、A-pose/T-pose 选择、人体与观测/拟合 marker 对照，以及停止后保存参数。
 它独立运行，不调用 Shogun 开拍/停拍、不改正式录制服务或历史原始数据。
 每个人、每次重新贴点都应重新标定；手指效果需要用实际贴点与动作检查。
 
@@ -166,7 +172,7 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python run_web.py \
 ```
 
 打开 `http://<lab-IP>:8792`。先在 Shogun 确认正确人物和全身标签，再在网页手动启动标定采样。
-倒计时后 T-pose 保持 3 秒，其余时间做活动范围动作（默认总采样 45 秒）。
+先选择实际采用的静止姿态，倒计时后保持该姿态 3 秒，其余时间做活动范围动作或自由活动（默认总采样 45 秒）。
 采样结束后点击计算标定，完成后再点击实时拟合。首次初始化与 JIT 编译耗时另计。
 所有现场测试保存在独立 `runtime/<UTC时间_唯一编号>/`：采样 marker、采样时钟、标定、日志、
 拟合序列和 `session.json`。`runtime/status.json` 是当前运行状态，不表示精度验收。
@@ -175,3 +181,6 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python run_web.py \
 服务只绑定实验室地址或回环地址；外网查看使用已有 SSH 连接转发，不直接暴露控制页。
 
 现场端口依据：[Shogun 1.14 官方手册](https://help.vicon.com/download/attachments/196380086/Getting%20started%20with%20Vicon%20Shogun.pdf)。
+
+已保存的标定候选可用 `run_web.py --calib <subject_calib.npz> --subject <实际被试名>` 加载，
+不必重复采样。文件必须含匹配的 `source_subject`；加载后仍需检查真实几何和运动，不自动开始拟合。
