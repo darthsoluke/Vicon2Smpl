@@ -96,6 +96,8 @@ class FieldApp:
             if self.fit_hands:
                 self.server.gui.add_button("左手近景").on_click(lambda _: self.show_hand("L"))
                 self.server.gui.add_button("右手近景").on_click(lambda _: self.show_hand("R"))
+            if self.model.num_joints == 55:
+                self.server.gui.add_button("头部近景").on_click(lambda _: self.show_head())
             self.show_mesh = self.server.gui.add_checkbox("显示人体网格", initial_value=True)
             self.show_mesh.on_update(lambda _: self._mesh_visibility())
         self.base_detail = ("本次拟合 **SMPL-X 身体＋双手 72 点**：52 个身体/手腕点和 20 个手指点。手指使用手形先验约束，需检查张手、握拳与捏合。" if self.fit_hands else
@@ -151,6 +153,9 @@ class FieldApp:
         self.update_hand_camera()
 
     def update_hand_camera(self):
+        if self.view_mode == "head":
+            self.update_head_camera()
+            return
         if self.view_mode not in ("L", "R") or self.last_result is None:
             return
         result = self.last_result
@@ -165,6 +170,27 @@ class FieldApp:
             client.camera.look_at = target
             client.camera.position = position
             client.camera.up_direction = up
+
+    def show_head(self):
+        if self.mode != "tracking" or self.last_result is None or self.model.num_joints != 55:
+            return
+        self.view_mode = "head"
+        self.cloud.point_size, self.fitted.point_size = .003, .0025
+        self.update_head_camera()
+
+    def update_head_camera(self):
+        result = self.last_result
+        rw, joints = self.model.fk(result.R, self.rig.J_rest)
+        head = self.rig.v_rest[self.model.weights.argmax(1) == 15].mean(0)
+        target = joints[15] + result.trans + rw[15] @ (head - self.rig.J_rest[15])
+        forward = rw[9, :, 2].copy()
+        forward[1] = 0
+        forward /= max(np.linalg.norm(forward), 1e-9)
+        for client in self.server.get_clients().values():
+            client.camera.look_at = target
+            client.camera.position = target + .5 * forward + np.array([0., .02, 0.])
+            # A head-fixed camera would visually hide the very tilt being inspected.
+            client.camera.up_direction = (0., 1., 0.)
 
     def change_subject(self, _):
         with self.lock:
@@ -407,6 +433,9 @@ np.savez(sys.argv[6],**result)
             self.detail.content += (f"\n\n**SMPL-X 身体＋双手 72 点**。身体点残差中位数 "
                                     f"**{np.median(residual[~finger_mask]):.1f} mm**；手指点 "
                                     f"**{np.median(residual[finger_mask]):.1f} mm**。手指使用学习手形先验约束，尚待真人近景检查。")
+        with np.load(path, allow_pickle=False) as metadata:
+            if "head_neutral_reference_confirmed" in metadata and bool(metadata["head_neutral_reference_confirmed"]):
+                self.detail.content += "\n\n头部绑定已按本人正头参考校准；点头、转头和侧倾继续由 marker 驱动。"
 
     def _group_marker_rms(self):
         if self.finger_marker_mask is None or self.last_result is None or self.last_observation is None:
@@ -545,6 +574,9 @@ np.savez(sys.argv[6],**result)
                                        body_marker_rms_mm=groups["body_mm"] if groups else None,
                                        finger_marker_rms_mm=groups["finger_mm"] if groups else None,
                                        solver_status=self.last_result.status if self.mode == "tracking" and self.last_result else None)
+                        if self.mode == "tracking" and self.last_result is not None:
+                            rw, _ = self.model.fk(self.last_result.R, self.rig.J_rest)
+                            receipt["head_world_up_tilt_degrees"] = float(np.degrees(np.arccos(np.clip(rw[15, 1, 1], -1., 1.))))
                         target = self.root / "status.json"
                         temp = target.with_suffix(".tmp")
                         temp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
