@@ -499,7 +499,7 @@ np.savez(sys.argv[6],**result)
                             verts = self.model.vertices(res.R, res.trans, self.rig.v_rest, self.rig.J_rest).astype(np.float32)
                             if self.mesh is None:
                                 self.mesh = self.server.scene.add_mesh_simple("/body", vertices=verts,
-                                    faces=self.model.faces.astype(np.uint32), color=(135, 162, 198), opacity=0.65)
+                                    faces=self.model.faces.astype(np.uint32), color=(135, 162, 198), opacity=1.0)
                             else:
                                 self.mesh.vertices = verts
                         if self.mesh:
