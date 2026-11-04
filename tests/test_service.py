@@ -113,10 +113,12 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse((self.root / "output" / service.PID_NAME).exists())
 
     def test_venv_python_symlink_is_preserved_in_child_and_manager_launches(self):
-        venv_bin = self.root / "venv" / "bin"
-        venv_bin.mkdir(parents=True)
+        venv_root = self.root / "venv"
+        # Include pyvenv.cfg so standalone Python distributions find their stdlib.
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", "--symlinks", str(venv_root)],
+                       check=True, capture_output=True, text=True, timeout=30)
+        venv_bin = venv_root / "bin"
         python = venv_bin / "python"
-        python.symlink_to(Path(sys.executable).resolve())
         self.cfg["python"] = "venv/bin/python"
         self.write_config()
         loaded = service.load_config(self.config)
