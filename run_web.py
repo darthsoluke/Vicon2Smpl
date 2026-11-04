@@ -15,6 +15,7 @@ from vsmpl.native_source import NativeSource, subject_frame
 from vsmpl.outputs import SequenceRecorder
 from vsmpl.solver import RealtimeSolver
 from vsmpl.sources import NameMapper, save_recording
+from vsmpl.calibration_input import prepare_calibration_input
 
 
 class FieldApp:
@@ -33,6 +34,12 @@ class FieldApp:
         self.last_result = None
         self.fit_count = 0
         self.model = BodyModel.load(args.model_path, args.model_type, args.gender)
+        self.body_regions = None
+        if getattr(args, "body_regions", None):
+            regions = json.loads(Path(args.body_regions).read_text())
+            count = len(regions)
+            dummy = dict(names=list(regions), pos=np.empty((0, count, 3)), valid=np.empty((0, count), bool))
+            _, self.body_regions = prepare_calibration_input(dummy, regions, len(self.model.v_template))
         self.source = NativeSource(args.native_reader, args.source)
         self.server = viser.ViserServer(host=args.bind, port=args.port)
         self.server.gui.configure_theme(titlebar_content=None, control_layout="fixed", control_width="medium",
@@ -69,7 +76,9 @@ class FieldApp:
             self.center.on_click(self.center_view)
             self.show_mesh = self.server.gui.add_checkbox("显示人体网格", initial_value=True)
             self.show_mesh.on_update(lambda _: self._mesh_visibility())
-        self.detail = self.server.gui.add_markdown("红点：观测 marker；绿点：拟合 marker。手指质量取决于手部贴点布局。")
+        self.base_detail = (f"本次仅拟合 **{len(self.body_regions)} 个身体/手腕点**，手指点不参与。" if self.body_regions else
+                            "红点：观测 marker；绿点：拟合 marker。手指质量取决于手部贴点布局。")
+        self.detail = self.server.gui.add_markdown(self.base_detail)
         self.server.gui.add_markdown("本页仅采样标定 marker 与保存派生拟合；正式录制仍使用原录制页面。")
         self.server.on_client_connect(lambda event: self.center_view(event))
         if getattr(args, "calib", None):
@@ -118,6 +127,7 @@ class FieldApp:
             self.recording = None
             self.calibration_path = None
             self.last_result = None
+            self.detail.content = self.base_detail
             self.mode = "preview"
             self.track_button.disabled = self.fit_button.disabled = True
             self.fitted.visible = False
@@ -137,6 +147,7 @@ class FieldApp:
                 return
             self.mode = "countdown"
             self.sample_static_pose = "a" if self.pose_kind.value.startswith("A") else "t"
+            self.sample_body_regions = None if self.body_regions is None else json.loads(json.dumps(self.body_regions))
             self.countdown_end = time.perf_counter() + 5
             self.samples = []
             self.run = self.root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8])
@@ -172,9 +183,13 @@ class FieldApp:
             save_recording(self.run / "calibration_markers.npz", first["names"], frames, pos, valid, fps)
             np.savez_compressed(self.run / "sampling_clock.npz", relative_host_arrival_seconds=times,
                                 source_frame_numbers=frames)
+            if self.sample_body_regions is not None:
+                # Freeze only anatomical regions. The new subject's shape and attachments are fitted afresh.
+                (self.run / "marker_regions.json").write_text(json.dumps(self.sample_body_regions))
             self._receipt("sampled", source_fps=self.source.frame_rate, sampled_fps=fps,
                           samples=len(times), tpose_window=list(self.tpose_window), duration_seconds=float(times[-1]),
-                          static_pose=self.sample_static_pose)
+                          static_pose=self.sample_static_pose,
+                          marker_scope="body_wrist_only" if self.sample_body_regions is not None else "all_markers")
             self.fit_button.disabled = times[-1] < 10 or self.tpose_window[1] - self.tpose_window[0] < 5
             self.message = f"已保留 {len(times)} 帧 / {times[-1]:.1f} 秒。" + ("可以计算标定。" if not self.fit_button.disabled else "采样太短，请重新采样。")
 
@@ -195,22 +210,34 @@ class FieldApp:
             self.message = "正在计算被试体型与 marker 布局；进度保存在 calibration.log。"
             # Run the existing CLI in a worker process: its CPU work cannot block the browser.
             metadata = self.run / "calibration_request.json"
-            metadata.write_text(json.dumps({"tpose": list(self.tpose_window), "static_pose": self.sample_static_pose}))
+            metadata.write_text(json.dumps({"tpose": list(self.tpose_window), "static_pose": self.sample_static_pose,
+                "source_subject": self.selected,
+                "body_regions_file": "marker_regions.json" if self.sample_body_regions is not None else None}))
             threading.Thread(target=self._calibrate, daemon=True).start()
 
     def _calibrate(self):
         import subprocess
         import sys
         output = self.run / "subject_calib.npz"
-        code = """import json,numpy as np,sys
+        code = """import json,numpy as np,sys,hashlib
+from pathlib import Path
 from vsmpl.body_model import BodyModel
 from vsmpl.calibration import calibrate
+from vsmpl.calibration_input import prepare_calibration_input
 from vsmpl.sources import load_recording
 model=BodyModel.load(sys.argv[1],sys.argv[2],sys.argv[3])
 rec=load_recording(sys.argv[4])
-window=json.load(open(sys.argv[5]))['tpose']
-result=calibrate(model,rec,tpose=tuple(window),static_pose=sys.argv[7])
-np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=sys.argv[8],**result)
+request=json.loads(Path(sys.argv[5]).read_text())
+assert request['source_subject']==sys.argv[8], 'Calibration subject association changed'
+region_file=Path(sys.argv[5]).parent/request['body_regions_file'] if request['body_regions_file'] else None
+regions=json.loads(region_file.read_text()) if region_file else None
+all_names=list(rec['names'])
+rec,regions=prepare_calibration_input(rec,regions,len(model.v_template))
+result=calibrate(model,rec,tpose=tuple(request['tpose']),static_pose=request['static_pose'],marker_regions=regions)
+np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=request['source_subject'],
+marker_scope='body_wrist_only' if regions is not None else 'all_markers',
+marker_regions_sha256=hashlib.sha256(region_file.read_bytes()).hexdigest() if region_file else '',
+excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],dtype=str),**result)
 """
         try:
             with (self.run / "calibration.log").open("w") as log:
@@ -383,6 +410,7 @@ def main():
     parser.add_argument("--output", default="runtime")
     parser.add_argument("--calib", help="load a separately reviewed calibration candidate without resampling")
     parser.add_argument("--subject", help="explicit subject associated with --calib")
+    parser.add_argument("--body-regions", help="validated body/wrist region JSON; freeze per sample and exclude other markers from fitting")
     FieldApp(parser.parse_args()).loop()
 
 

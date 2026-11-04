@@ -65,3 +65,10 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=
 同一段 45 秒记录的跟踪 marker RMSE 中位数 4.35 mm、p95 6.62 mm。
 开头 A-pose 的正侧视、足部近景及 1/13/28/40 秒同视角叠加已检查，腿脚错误对应已消除。
 这些是对原始 marker 的贴合检查，真人实时姿态质量仍待现场确认。
+
+## 2026-11-04 新被试
+
+当前 Shogun 人物为 `zhr`。操作者确认是新被试或重新贴点，不能复用 `st` 的体型和贴点参数。
+网页新采样使用 `--body-regions` 指向已核对的 52 点身体/手腕区域定义；该文件只描述模型拓扑上的身体部位，
+不携带 `st` 的 beta、offset 或对应顶点结果。每段另存区域快照，新人物重新求解。
+完整 72 点来源采样继续保留，worker 仅选 52 点参与拟合。

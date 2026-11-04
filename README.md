@@ -184,3 +184,8 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python run_web.py \
 
 已保存的标定候选可用 `run_web.py --calib <subject_calib.npz> --subject <实际被试名>` 加载，
 不必重复采样。文件必须含匹配的 `source_subject`；加载后仍需检查真实几何和运动，不自动开始拟合。
+
+新被试或重新贴点时应重新采样和标定。网页加 `--body-regions <已核对区域.json>` 可固定为身体/手腕模式：
+保留完整来源采样，冻结本次区域文件，在标定 worker 中仅使用白名单标签，排除手指点。
+新人的体型、对应顶点及偏移均重新估计；输出保留新被试名、排除点名及区域快照 SHA256。
+缺少配置所需标签或区域不合法时明确失败，不回退到无约束的全点拟合。
