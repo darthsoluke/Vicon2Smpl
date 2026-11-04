@@ -132,6 +132,22 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(state["owned"] and state["child_owned"])
         self.assertEqual(self.cli("stop")["state"], "stopped")
 
+    def test_data_output_is_validated_and_forwarded_without_moving_hot_state(self):
+        bulk = self.root / "bulk"
+        self.cfg["data_output"] = "bulk"
+        self.write_config()
+        self.assertIn("Expected dir", self.cli("preflight", success=False)["error"])
+        bulk.mkdir()
+        args = self.cli("preflight")["argv"]
+        self.assertEqual(args[args.index("--data-output") + 1], str(bulk))
+        self.assertEqual(args[args.index("--output") + 1], str(self.root / "output"))
+        self.cli("start")
+        self.wait_file("status.json")
+        self.assertTrue((self.root / "output" / service.LOCK_NAME).is_file())
+        self.assertFalse((bulk / service.LOCK_NAME).exists())
+        self.assertFalse((bulk / "status.json").exists())
+        self.assertEqual(self.cli("stop")["state"], "stopped")
+
     def test_concurrent_starts_create_one_child_and_repeat_start_reuses_it(self):
         starters = [subprocess.Popen(self.command("start"), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
                     for _ in range(4)]

@@ -2,6 +2,7 @@
   "python": "/absolute/path/to/environment/bin/python",
   "code_root": "..",
   "output": "/absolute/path/to/writable/runtime",
+  "data_output": "/absolute/path/to/bulk/calibration-and-fit-output",
   "source": "192.168.110.125:8802",
   "native_reader": "/absolute/path/to/native/live_markers",
   "model_path": "/absolute/path/to/licensed/smplx/neutral/model.npz",

@@ -62,7 +62,8 @@ python3 scripts/package_runtime.py \
   native/live_markers    已编译的只读 DataStream 桥接器
   assets/                授权模型、先验、区域 JSON
   config/site.json       相对于本包的现场配置，不预装他人的个人标定
-  runtime/               本实例状态、新采样和派生输出
+  runtime/               本实例热状态、锁和日志
+  data/                  新标定采样和拟合输出，可与热状态分开配置
   numba_cache/           本实例可写缓存
   restore.sh             不联网重建 venv
   SOURCE_COMMIT          源码提交
@@ -92,6 +93,10 @@ python3 scripts/package_runtime.py \
 把配置中的 IP、输出目录和依赖路径改成已检查的现场值。路径可以相对配置文件。
 服务默认只加载通用模型；新被试通过页面重新标定。只有同一被试、同一套贴点，才在本地配置添加
 `calib` 和 `subject`，两项必须一起填写，校验不能绕过。
+
+`output` 放热状态、锁和日志，`data_output` 放新采样和标定结果；省略后者时保持旧行为。
+共享存储上小文件操作较慢时，热状态与 Numba 缓存应留在本地快目录，数据输出再指向共享存储。
+已加载标定的拟合结果仍保留在其原父目录，不会因为新增参数改写历史关联。
 
 ```sh
 ./venv/bin/python code/scripts/service.py --config config/site.json preflight
@@ -129,3 +134,20 @@ python3 scripts/package_runtime.py \
 
 共享代码和依赖使用只读权限；服务状态、缓存和输出只允许指定操作者写入。不要对整个 home、SDK、
 模型目录或历史数据执行递归 `chmod 777`。服务器最终路径、版本、依赖清单和验证结果应写入独立部署回执。
+
+## 固定服务器的快速缓存恢复
+
+系统盘空间不足、共享盘小文件访问较慢时，可以把已经离线安装验证的完整运行时归档到持久存储，
+用 `scripts/launch_cached.py --config <启动配置.json>` 校验并恢复到指定用户的快速缓存目录。
+该归档必须在同一个 `cache_root` 前缀构建，不能冒充可任意迁移的 venv；通用迁移仍使用上文的独立 Python 与 wheelhouse。
+缓存只包含 Python、环境、代码、原生库和启动配置；个人采样、标定和拟合输出始终写持久数据目录。
+
+启动配置包含 `archive`、`archive_sha256`、`cache_root`，以及可选 `service_config`（默认 `config/site.json`）。
+首次启动核对归档哈希并安全解压，再生成 READY；后续复用匹配的完整缓存。缺少 READY、版本不符或损坏的
+已有缓存会保留并拒绝覆盖，由操作者核对后另行处理。准备阶段使用独立文件锁，运行阶段继续使用服务单例锁。
+`--prepare-only` 只恢复/检查，不连接硬件。
+
+若缓存位于 `/run/user/<UID>`，它会在重启后消失；持久归档和数据不受影响。
+用户服务可以在启动时重建缓存。部署回执应分别记录持久包、缓存恢复、离线安装、实际服务和输入源检查结果。
+`config/vicon2smpl.service.example` 提供用户服务模板；先核对路径和用户 linger 状态。
+它只启动预览控制台，不自动开始标定采样、拟合或演员录制。维护时仍先从网页停止并保存，再停止用户服务。

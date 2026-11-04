@@ -77,6 +77,7 @@ class NativeFrameTests(unittest.TestCase):
             app = run_web.FieldApp(args)
             try:
                 self.assertEqual(app.mode, "preview")
+                self.assertEqual(app.data_root, app.root)  # Legacy args omit data_output.
                 self.assertIsNone(app.recorder)
                 app.selected = "test"
                 app.start_sampling(None)
@@ -101,6 +102,78 @@ class NativeFrameTests(unittest.TestCase):
                 self.assertFalse(receipt["raw_capture_modified"])
                 output = np.load(app.run / receipt["last_solved_file"])
                 self.assertEqual(output["frame_numbers"].tolist(), [500])
+            finally:
+                app.server.stop()
+
+    def _path_test_app(self, folder, **overrides):
+        import run_web
+        import time
+
+        class FakeSource:
+            frame_rate, error = 10, ""
+            def __init__(self, *args): pass
+            def snapshot(self):
+                return 0, dict(frame=1, arrival_time=time.perf_counter(), subjects=[dict(
+                    name="test", markers=[dict(name=f"M{i:02}", valid=True, xyz=[100,200,1000])
+                                          for i in range(15)])])
+            def close(self): pass
+
+        args = SimpleNamespace(output=str(Path(folder) / "hot"), model_path="unused", model_type="smpl",
+                               gender="neutral", native_reader="unused", source="test-only",
+                               bind="127.0.0.1", port=0, **overrides)
+        with patch.object(run_web.BodyModel, "load", return_value=SimpleNamespace(num_joints=24)), \
+                patch.object(run_web, "NativeSource", FakeSource):
+            return run_web.FieldApp(args)
+
+    def test_data_output_keeps_new_samples_separate_from_hot_status(self):
+        import run_web
+        with tempfile.TemporaryDirectory() as folder:
+            data = Path(folder) / "bulk"
+            app = self._path_test_app(folder, data_output=str(data))
+            entered_loop = False
+            try:
+                self.assertEqual(app.root, Path(folder) / "hot")
+                self.assertEqual(app.data_root, data)
+                app.selected = "test"
+                app.start_sampling(None)
+                self.assertEqual(app.run.parent, data)
+                _, packet = app.source.snapshot()
+                sample = subject_frame(packet, "test")
+                app.samples = [sample, dict(sample, frame=2, time=sample["time"]+12)]
+                app.mode = "sampling"
+                app.finish_sampling(None)
+                self.assertTrue((app.run / "calibration_markers.npz").is_file())
+                self.assertFalse(any(app.root.glob("*/calibration_markers.npz")))
+                # Stop after the first ordinary loop iteration, which writes status.json.
+                entered_loop = True
+                with self.assertRaisesRegex(RuntimeError, "one iteration"), \
+                        patch.object(run_web.time, "sleep", side_effect=RuntimeError("one iteration")):
+                    app.loop()
+                self.assertTrue((app.root / "status.json").is_file())
+                self.assertFalse((data / "status.json").exists())
+            finally:
+                if not entered_loop:
+                    app.server.stop()
+
+    def test_loading_existing_calibration_retains_its_original_run_directory(self):
+        import run_web
+        with tempfile.TemporaryDirectory() as folder:
+            historical = Path(folder) / "history" / "original_run"
+            historical.mkdir(parents=True)
+            checkpoint = historical / "subject_calib.npz"
+            np.savez(checkpoint, source_subject="test", static_pose="a", preserved="original bytes")
+            before = checkpoint.read_bytes()
+            bulk = Path(folder) / "new_bulk"
+            with patch.object(run_web.FieldApp, "_load_calibration") as load:
+                app = self._path_test_app(folder, data_output=str(bulk), calib=str(checkpoint), subject="test")
+            try:
+                self.assertEqual(app.run, historical.resolve())
+                self.assertEqual(app.calibration_path, checkpoint.resolve())
+                self.assertEqual(app.selected, "test")
+                self.assertEqual(app.data_root, bulk)
+                load.assert_called_once_with(checkpoint.resolve())
+                self.assertEqual(checkpoint.read_bytes(), before)
+                self.assertEqual(list(bulk.iterdir()), [])
             finally:
                 app.server.stop()
 

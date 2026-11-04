@@ -87,9 +87,9 @@ def build(args):
         (output / "assets").mkdir()
         for name, path in inputs.items():
             shutil.copy2(path, output / "assets" / name)
-        for directory in ("runtime", "numba_cache", "config"):
+        for directory in ("runtime", "data", "numba_cache", "config"):
             (output / directory).mkdir(mode=0o700 if directory == "runtime" else 0o755)
-        config = dict(python="../venv/bin/python", code_root="../code", output="../runtime",
+        config = dict(python="../venv/bin/python", code_root="../code", output="../runtime", data_output="../data",
                       source=args.vicon_source, native_reader="../native/live_markers",
                       model_path="../assets/model.npz", model_type="smplx", bind=args.bind,
                       port=args.port, body_regions="../assets/body_marker_regions.json",

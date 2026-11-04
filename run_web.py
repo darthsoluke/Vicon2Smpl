@@ -26,6 +26,8 @@ class FieldApp:
         self.args = args
         self.root = Path(args.output)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.data_root = Path(getattr(args, "data_output", None) or args.output)
+        self.data_root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.mode, self.message = "preview", "选择被试后开始标定；尚未生成任何拟合结果。"
         self.run = None
@@ -232,7 +234,7 @@ class FieldApp:
             self.sample_hand_prior_sha256 = self.hand_prior_sha256
             self.countdown_end = time.perf_counter() + 5
             self.samples = []
-            self.run = self.root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8])
+            self.run = self.data_root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8])
             self.run.mkdir()
             self.recording = self.calibration_path = None
             self.calibration_scope = None
@@ -599,6 +601,7 @@ def main():
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8792)
     parser.add_argument("--output", default="runtime")
+    parser.add_argument("--data-output", help="directory for new calibration samples/results; defaults to --output; loaded calibrations retain their existing run directory")
     parser.add_argument("--calib", help="load a separately reviewed calibration candidate without resampling")
     parser.add_argument("--subject", help="explicit subject associated with --calib")
     parser.add_argument("--body-regions", help="validated body/wrist region JSON; freeze per sample and exclude other markers from fitting")

@@ -57,14 +57,14 @@ def load_config(path):
     raw = _read_json(path)
     required = {"python", "code_root", "output", "source", "native_reader", "model_path", "bind", "port"}
     allowed = required | {"model_type", "body_regions", "fit_hands", "hand_prior",
-                          "hand_components", "calib", "subject", "library_path", "numba_cache"}
+                          "hand_components", "calib", "subject", "library_path", "numba_cache", "data_output"}
     if not isinstance(raw, dict) or required - raw.keys() or raw.keys() - allowed:
         missing = sorted(required - raw.keys()) if isinstance(raw, dict) else sorted(required)
         extra = sorted(raw.keys() - allowed) if isinstance(raw, dict) else []
         raise ServiceError(f"Invalid config: missing={missing}, unknown={extra}")
     cfg = dict(raw)
     for name in ("python", "code_root", "output", "native_reader", "model_path",
-                 "body_regions", "hand_prior", "calib", "numba_cache"):
+                 "body_regions", "hand_prior", "calib", "numba_cache", "data_output"):
         if name in cfg:
             if not isinstance(cfg[name], str) or not cfg[name]:
                 raise ServiceError(f"{name} must be a nonempty path string")
@@ -127,6 +127,8 @@ def validate_paths(cfg):
     if Path(cfg["service_script"]).resolve() != Path(__file__).resolve():
         raise ServiceError("Run the service.py located inside this config's code_root")
     _require_path(cfg["output"], "dir", writable=True)
+    if "data_output" in cfg:
+        _require_path(cfg["data_output"], "dir", writable=True)
     model = Path(cfg["model_path"])
     _require_path(model, "dir" if model.is_dir() else "file")
     for key in ("body_regions", "hand_prior", "calib"):
@@ -140,7 +142,7 @@ def validate_paths(cfg):
 
 def child_argv(cfg):
     args = [cfg["python"], "-u", str(Path(cfg["code_root"]) / "run_web.py")]
-    for key in ("source", "native_reader", "model_path", "model_type", "bind", "port", "output", "body_regions"):
+    for key in ("source", "native_reader", "model_path", "model_type", "bind", "port", "output", "data_output", "body_regions"):
         if key in cfg:
             args.extend(["--" + key.replace("_", "-"), str(cfg[key])])
     if cfg["fit_hands"]:

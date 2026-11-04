@@ -1,0 +1,24 @@
+[Unit]
+Description=Vicon2Smpl shared laboratory console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Replace the two absolute deployment paths with checked site paths.
+ExecStart=/usr/bin/python3 /absolute/deployment/source/scripts/launch_cached.py --config /absolute/deployment/config/launch.json
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+KillMode=process
+TimeoutStopSec=180
+SendSIGKILL=no
+Environment=OMP_NUM_THREADS=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=CUDA_VISIBLE_DEVICES=
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
