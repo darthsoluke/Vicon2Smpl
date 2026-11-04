@@ -126,6 +126,28 @@ class OfflineEnvironmentTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "variant differs"):
             EXPORT.validate_wheel_identities(bundle / "wheelhouse", [dict(name="demo", version="1.0+cpu")])
 
+    def test_vendored_dependency_metadata_does_not_change_wheel_identity(self):
+        bundle = self.bundle()
+        wheel = bundle / "wheelhouse/demo-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("demo/_vendor/dependency-9.0.dist-info/METADATA",
+                             "Metadata-Version: 2.1\nName: dependency\nVersion: 9.0\n")
+        EXPORT.validate_wheel_identities(bundle / "wheelhouse", [dict(name="demo", version="1.0")])
+
+    def test_multiple_top_level_wheel_metadata_is_rejected(self):
+        bundle = self.bundle()
+        wheel = bundle / "wheelhouse/demo-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "a") as archive:
+            archive.writestr("other-2.0.dist-info/METADATA",
+                             "Metadata-Version: 2.1\nName: other\nVersion: 2.0\n")
+        with self.assertRaisesRegex(RuntimeError, "Invalid bundled wheel"):
+            EXPORT.validate_wheel_identities(bundle / "wheelhouse", [dict(name="demo", version="1.0")])
+
+    def test_top_level_name_must_match_required_distribution(self):
+        bundle = self.bundle()
+        with self.assertRaisesRegex(RuntimeError, "identities are missing"):
+            EXPORT.validate_wheel_identities(bundle / "wheelhouse", [dict(name="different", version="1.0")])
+
     def test_manifest_hash_tamper_fails_before_creating_venv(self):
         bundle = self.bundle()
         INSTALL.verify(bundle)

@@ -110,7 +110,10 @@ def validate_wheel_identities(wheelhouse, packages):
     for wheel in wheelhouse.glob("*.whl"):
         try:
             with zipfile.ZipFile(wheel) as archive:
-                members = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
+                # A wheel may vendor dependencies and their nested dist-info.
+                # Only its single top-level distribution owns this wheel.
+                members = [name for name in archive.namelist()
+                           if name.count("/") == 1 and name.endswith(".dist-info/METADATA")]
                 if len(members) != 1:
                     raise ValueError("Expected one distribution METADATA in wheel")
                 metadata = Parser().parsestr(archive.read(members[0]).decode("utf-8"))

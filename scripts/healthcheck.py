@@ -41,17 +41,19 @@ def check(config_path, *, skip_model=False):
     for module in ("numpy", "torch", "smplx", "numba", "viser", "websockets", "ezc3d"):
         record("import_" + module, lambda module=module: str(getattr(importlib.import_module(module), "__version__", "importable")))
 
-    def output_probe():
-        output = path("output")
+    def output_probe(key):
+        output = path(key)
         if not output.is_dir():
-            raise ValueError("output must be an existing directory")
+            raise ValueError(key + " must be an existing directory")
         with tempfile.NamedTemporaryFile(prefix=".healthcheck-", dir=output) as file:
             file.write(b"vicon2smpl deployment probe\n")
             file.flush()
             os.fsync(file.fileno())
         return dict(path=str(output), free_bytes=shutil.disk_usage(output).free)
 
-    record("output", output_probe)
+    record("output", lambda: output_probe("output"))
+    if config.get("data_output"):
+        record("data_output", lambda: output_probe("data_output"))
 
     def native_check():
         binary = path("native_reader")
