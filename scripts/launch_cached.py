@@ -141,10 +141,58 @@ def _member(member, cache_root):
     return member
 
 
+def runtime_data_filter(member, destination):
+    """Retain data-filter boundaries with correct relative-symlink semantics.
+
+    Some distro security backports resolve a symlink relative to the archive
+    root, as if it were a hardlink. Check its real destination relative to its
+    parent ourselves, while delegating every other check/attribute to the
+    standard data filter. Hardlinks retain their archive-root semantics.
+    """
+    member = _member(member, Path(destination))
+    if member is None:
+        return None
+    if not member.issym():
+        return tarfile.data_filter(member, destination)
+    if os.path.isabs(member.linkname):
+        raise tarfile.AbsoluteLinkError(member)
+    root = os.path.realpath(destination)
+    target = os.path.realpath(os.path.join(root, os.path.dirname(member.name), member.linkname))
+    if os.path.commonpath([root, target]) != root:
+        raise tarfile.LinkOutsideDestinationError(member, target)
+    filtered = tarfile.data_filter(member.replace(linkname=".", deep=False), destination)
+    return None if filtered is None else filtered.replace(linkname=member.linkname, deep=False)
+
+
+class RuntimeTarFile(tarfile.TarFile):
+    """Extract our own snapshots without tarfile's link-copy fallbacks.
+
+    Older distro tarfile versions can copy a different archive member without
+    filtering it again after link creation fails. Our cache archive contract
+    needs real links and only backward hardlinks, so fail rather than emulate.
+    """
+    def makelink(self, member, targetpath):
+        try:
+            if member.issym():
+                os.symlink(member.linkname, targetpath)
+            else:
+                source = getattr(member, "_link_target", None)
+                if not source or not os.path.lexists(source):
+                    raise CacheError("Runtime hardlink target has not been extracted: " + member.name)
+                os.link(source, targetpath)
+        except (OSError, NotImplementedError) as exc:
+            raise CacheError("Runtime link creation failed; incomplete cache was preserved: " + member.name) from exc
+
+    def makelink_with_filter(self, member, targetpath, filter_function=None, extraction_root=None):
+        # Newer Python calls this entry point directly; older Python calls
+        # makelink. Neither path may invoke the stdlib copy fallback.
+        return self.makelink(member, targetpath)
+
+
 def _extract(source, cache_root):
-    with tarfile.open(fileobj=source, mode="r:gz") as archive:
+    with RuntimeTarFile.open(fileobj=source, mode="r:gz") as archive:
         members = [_member(member, cache_root) for member in archive.getmembers()]
-        archive.extractall(cache_root, members=[m for m in members if m is not None], filter="data")
+        archive.extractall(cache_root, members=[m for m in members if m is not None], filter=runtime_data_filter)
 
 
 def _inside(cache_root, relative, executable=False):

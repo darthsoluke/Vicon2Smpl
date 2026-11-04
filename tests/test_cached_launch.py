@@ -129,6 +129,130 @@ class CachedLaunchTests(unittest.TestCase):
         self.assertFalse(Path(os.readlink(python)).is_absolute())
         self.assertEqual(python.resolve(), (self.cache / "python/bin/python3").resolve())
 
+    def old_distro_filter(self):
+        standard = tarfile.data_filter
+        calls = []
+        def old(member, destination):
+            calls.append((member.name, member.type, member.linkname))
+            # Model the Ubuntu backport bug: both link kinds are checked
+            # relative to the archive root, ignoring a symlink's parent.
+            if member.issym() or member.islnk():
+                root = os.path.realpath(destination)
+                target = os.path.realpath(os.path.join(root, member.linkname))
+                if os.path.commonpath([root, target]) != root:
+                    raise tarfile.LinkOutsideDestinationError(member, target)
+            return standard(member, destination)
+        return old, calls
+
+    def terminfo_members(self, target="python/share/terminfo/a/adm1178"):
+        data = b"valid terminal data"
+        regular = tarfile.TarInfo(target)
+        regular.size = len(data)
+        alias = tarfile.TarInfo("python/share/terminfo/1/1178")
+        alias.type, alias.linkname = tarfile.SYMTYPE, "../a/adm1178"
+        return [(regular, data), (alias, None)]
+
+    def test_terminfo_relative_symlink_passes_old_distro_filter(self):
+        members = self.terminfo_members()
+        _, cfg = self.fixture(extra=members)
+        old, _ = self.old_distro_filter()
+        with self.assertRaises(tarfile.LinkOutsideDestinationError):
+            old(members[-1][0], self.cache)
+        with patch.object(LAUNCH.tarfile, "data_filter", side_effect=old):
+            LAUNCH.prepare(cfg)
+        alias = self.cache / "python/share/terminfo/1/1178"
+        self.assertEqual(os.readlink(alias), "../a/adm1178")
+        self.assertEqual(alias.read_bytes(), b"valid terminal data")
+
+    def test_internal_ancestor_chain_keeps_symlink_semantics(self):
+        members = self.terminfo_members("python/share/terminfo/data/a/adm1178")
+        directory = tarfile.TarInfo("python/share/terminfo/data/1")
+        directory.type = tarfile.DIRTYPE
+        first = tarfile.TarInfo("python/share/terminfo/1")
+        first.type, first.linkname = tarfile.SYMTYPE, "aliases/one"
+        second = tarfile.TarInfo("python/share/terminfo/aliases/one")
+        second.type, second.linkname = tarfile.SYMTYPE, "../data/1"
+        _, cfg = self.fixture(extra=[members[0], (directory, None), (second, None), (first, None), members[1]])
+        old, _ = self.old_distro_filter()
+        with patch.object(LAUNCH.tarfile, "data_filter", side_effect=old):
+            LAUNCH.prepare(cfg)
+        alias = self.cache / "python/share/terminfo/1/1178"
+        self.assertEqual(alias.read_bytes(), b"valid terminal data")
+        self.assertEqual(alias.resolve(), (self.cache / "python/share/terminfo/data/a/adm1178").resolve())
+
+    def test_external_ancestor_symlink_is_still_rejected(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        ancestor = self.cache / "python/share/terminfo/1"
+        ancestor.parent.mkdir(parents=True)
+        ancestor.symlink_to(outside, target_is_directory=True)
+        alias = self.terminfo_members()[-1][0]
+        old, _ = self.old_distro_filter()
+        with patch.object(LAUNCH.tarfile, "data_filter", side_effect=old):
+            with self.assertRaises(tarfile.LinkOutsideDestinationError):
+                LAUNCH.runtime_data_filter(alias, self.cache)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_hardlink_is_passed_unchanged_to_standard_filter(self):
+        members = self.terminfo_members()
+        hard = tarfile.TarInfo("python/share/terminfo/hard-copy")
+        hard.type, hard.linkname = tarfile.LNKTYPE, members[0][0].name
+        _, cfg = self.fixture(extra=[members[0], (hard, None)])
+        old, calls = self.old_distro_filter()
+        with patch.object(LAUNCH.tarfile, "data_filter", side_effect=old):
+            LAUNCH.prepare(cfg)
+        self.assertIn((hard.name, tarfile.LNKTYPE, hard.linkname), calls)
+        original = self.cache / members[0][0].name
+        copied = self.cache / hard.name
+        self.assertEqual(original.stat().st_ino, copied.stat().st_ino)
+
+    def test_filter_reapplies_member_validation_and_skips_archive_root(self):
+        directory = tarfile.TarInfo(".")
+        directory.type = tarfile.DIRTYPE
+        self.assertIsNone(LAUNCH.runtime_data_filter(directory, self.cache))
+        escaping = tarfile.TarInfo("../outside")
+        with self.assertRaisesRegex(LAUNCH.CacheError, "escapes cache"):
+            LAUNCH.runtime_data_filter(escaping, self.cache)
+
+    def test_symlink_failure_never_uses_copy_fallback_or_marks_ready(self):
+        alias = tarfile.TarInfo("interpreter-alias")
+        alias.type, alias.linkname = tarfile.SYMTYPE, "python/bin/python3"
+        _, cfg = self.fixture(extra=[(alias, None)])
+        with patch.object(LAUNCH.os, "symlink", side_effect=OSError("forced link failure")):
+            with patch.object(LAUNCH.RuntimeTarFile, "_find_link_target", side_effect=AssertionError("copy fallback forbidden")):
+                with self.assertRaisesRegex(LAUNCH.CacheError, "link creation failed"):
+                    LAUNCH.prepare(cfg)
+        self.assertTrue(self.cache.is_dir())
+        self.assertTrue((self.cache / "python/bin/python3").is_file())
+        self.assertFalse((self.cache / alias.name).exists())
+        self.assertFalse((self.cache / "READY.json").exists())
+
+    def test_hardlink_failure_never_uses_copy_fallback_or_marks_ready(self):
+        hard = tarfile.TarInfo("interpreter-hardlink")
+        hard.type, hard.linkname = tarfile.LNKTYPE, "python/bin/python3"
+        _, cfg = self.fixture(extra=[(hard, None)])
+        with patch.object(LAUNCH.os, "link", side_effect=OSError("forced link failure")):
+            with patch.object(LAUNCH.RuntimeTarFile, "_find_link_target", side_effect=AssertionError("copy fallback forbidden")):
+                with self.assertRaisesRegex(LAUNCH.CacheError, "link creation failed"):
+                    LAUNCH.prepare(cfg)
+        self.assertTrue(self.cache.is_dir())
+        self.assertTrue((self.cache / "python/bin/python3").is_file())
+        self.assertFalse((self.cache / hard.name).exists())
+        self.assertFalse((self.cache / "READY.json").exists())
+
+    def test_forward_hardlink_is_rejected_without_copying_later_member(self):
+        hard = tarfile.TarInfo("code/forward-copy")
+        hard.type, hard.linkname = tarfile.LNKTYPE, "code/later.bin"
+        later = tarfile.TarInfo("code/later.bin")
+        later.size = 4
+        _, cfg = self.fixture(extra=[(hard, None), (later, b"data")])
+        with patch.object(LAUNCH.RuntimeTarFile, "_find_link_target", side_effect=AssertionError("forward copy forbidden")):
+            with self.assertRaisesRegex(LAUNCH.CacheError, "has not been extracted"):
+                LAUNCH.prepare(cfg)
+        self.assertTrue(self.cache.is_dir())
+        self.assertFalse((self.cache / hard.name).exists())
+        self.assertFalse((self.cache / "READY.json").exists())
+
     def test_optional_runtime_manifest_is_checked_on_hot_reuse(self):
         data = b'{"build":"validated"}'
         member = tarfile.TarInfo("runtime-manifest.json")
