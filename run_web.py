@@ -66,9 +66,9 @@ class FieldApp:
         self.server.scene.set_up_direction("+y")
         self.server.scene.add_grid("/floor", plane="xz", width=10, height=10)
         self.cloud = self.server.scene.add_point_cloud("/observed", points=np.zeros((1, 3), np.float32),
-                                                       colors=(239, 91, 86), point_size=0.016, visible=False)
+                                                       colors=(239, 91, 86), point_size=0.008, point_shape="circle", visible=False)
         self.fitted = self.server.scene.add_point_cloud("/fitted", points=np.zeros((1, 3), np.float32),
-                                                        colors=(70, 200, 160), point_size=0.012, visible=False)
+                                                        colors=(70, 200, 160), point_size=0.006, point_shape="circle", visible=False)
         self.mesh = None
         self.server.gui.add_markdown("# Vicon → SMPL\n全身实时拟合 · 独立现场测试")
         self.status = self.server.gui.add_markdown("正在连接动捕数据…")
@@ -133,6 +133,7 @@ class FieldApp:
 
     def center_view(self, _):
         self.view_mode = "body"
+        self.cloud.point_size, self.fitted.point_size = .008, .006
         _, packet = self.source.snapshot()
         fr = subject_frame(packet, self.selected) if packet and self.selected else None
         points = fr["pos"][fr["valid"]] if fr else np.empty((0, 3))
@@ -146,6 +147,7 @@ class FieldApp:
         if self.mode != "tracking" or self.last_result is None or self.model.num_joints != 55:
             return
         self.view_mode = side
+        self.cloud.point_size, self.fitted.point_size = .003, .0025
         self.update_hand_camera()
 
     def update_hand_camera(self):
