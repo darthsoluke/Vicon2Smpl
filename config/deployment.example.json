@@ -1,0 +1,17 @@
+{
+  "python": "/absolute/path/to/environment/bin/python",
+  "code_root": "..",
+  "output": "/absolute/path/to/writable/runtime",
+  "source": "192.168.110.125:8802",
+  "native_reader": "/absolute/path/to/native/live_markers",
+  "model_path": "/absolute/path/to/licensed/smplx/neutral/model.npz",
+  "model_type": "smplx",
+  "bind": "192.168.110.211",
+  "port": 8792,
+  "body_regions": "/absolute/path/to/verified/body_marker_regions.json",
+  "fit_hands": true,
+  "hand_prior": "/absolute/path/to/licensed/smplx/pose_hand_prior.npz",
+  "hand_components": 20,
+  "library_path": ["/absolute/path/to/ViconSDK/lib"],
+  "numba_cache": "/absolute/path/to/writable/numba_cache"
+}

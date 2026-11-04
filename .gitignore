@@ -13,3 +13,17 @@ runtime/
 *.log
 *.pid
 native/live_markers
+# Internal deployment packages: dependencies and licensed assets stay off Git.
+bundles/
+wheelhouse/
+vendor/
+site-config/
+*.whl
+*.so
+*.so.*
+*.dll
+*.exe
+*.tar
+*.tar.gz
+*.tar.zst
+*.zip
