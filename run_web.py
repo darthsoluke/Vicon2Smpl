@@ -1,6 +1,7 @@
 """Browser controls for a separate Vicon2Smpl field test; never controls Shogun capture."""
 import argparse
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -8,7 +9,6 @@ import time
 import uuid
 
 import numpy as np
-import viser
 
 from vsmpl.body_model import BodyModel, MarkerRig
 from vsmpl.native_source import NativeSource, subject_frame
@@ -16,10 +16,13 @@ from vsmpl.outputs import SequenceRecorder
 from vsmpl.solver import RealtimeSolver
 from vsmpl.sources import NameMapper, save_recording
 from vsmpl.calibration_input import prepare_calibration_input
+from vsmpl.hand_pca import HandPCA
+from vsmpl.pca_solver import PCASolver
 
 
 class FieldApp:
     def __init__(self, args):
+        import viser
         self.args = args
         self.root = Path(args.output)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -29,9 +32,13 @@ class FieldApp:
         self.samples = []
         self.recording = None
         self.calibration_path = None
+        self.calibration_scope = None
         self.solver = self.rig = self.recorder = None
         self.selected = None
         self.last_result = None
+        self.last_observation = None
+        self.finger_marker_mask = None
+        self.view_mode = "body"
         self.fit_count = 0
         self.model = BodyModel.load(args.model_path, args.model_type, args.gender)
         self.body_regions = None
@@ -40,6 +47,18 @@ class FieldApp:
             count = len(regions)
             dummy = dict(names=list(regions), pos=np.empty((0, count, 3)), valid=np.empty((0, count), bool))
             _, self.body_regions = prepare_calibration_input(dummy, regions, len(self.model.v_template))
+        self.fit_hands = bool(getattr(args, "fit_hands", False))
+        self.hand_prior_source = self.hand_prior_sha256 = None
+        self.hand_pca_components = getattr(args, "hand_components", 12)
+        if self.fit_hands:
+            if args.model_type != "smplx" or self.model.num_joints != 55:
+                raise ValueError("Full body/hand fitting requires native SMPL-X55")
+            if self.body_regions is None or len(self.body_regions) != 52 or not getattr(args, "hand_prior", None):
+                raise ValueError("--fit-hands requires the validated 52-label --body-regions and --hand-prior")
+            prior_path = Path(args.hand_prior).resolve()
+            HandPCA.load(prior_path, n_components=self.hand_pca_components)
+            self.hand_prior_source = str(prior_path)
+            self.hand_prior_sha256 = hashlib.sha256(prior_path.read_bytes()).hexdigest()
         self.source = NativeSource(args.native_reader, args.source)
         self.server = viser.ViserServer(host=args.bind, port=args.port)
         self.server.gui.configure_theme(titlebar_content=None, control_layout="fixed", control_width="medium",
@@ -74,9 +93,13 @@ class FieldApp:
             self.stop_button.on_click(self.stop_tracking)
             self.center = self.server.gui.add_button("居中查看")
             self.center.on_click(self.center_view)
+            if self.fit_hands:
+                self.server.gui.add_button("左手近景").on_click(lambda _: self.show_hand("L"))
+                self.server.gui.add_button("右手近景").on_click(lambda _: self.show_hand("R"))
             self.show_mesh = self.server.gui.add_checkbox("显示人体网格", initial_value=True)
             self.show_mesh.on_update(lambda _: self._mesh_visibility())
-        self.base_detail = (f"本次仅拟合 **{len(self.body_regions)} 个身体/手腕点**，手指点不参与。" if self.body_regions else
+        self.base_detail = ("本次拟合 **SMPL-X 身体＋双手 72 点**：52 个身体/手腕点和 20 个手指点。手指使用手形先验约束，需检查张手、握拳与捏合。" if self.fit_hands else
+                            f"本次仅拟合 **{len(self.body_regions)} 个身体/手腕点**，手指点不参与。" if self.body_regions else
                             "红点：观测 marker；绿点：拟合 marker。手指质量取决于手部贴点布局。")
         self.detail = self.server.gui.add_markdown(self.base_detail)
         self.server.gui.add_markdown("本页仅采样标定 marker 与保存派生拟合；正式录制仍使用原录制页面。")
@@ -101,12 +124,15 @@ class FieldApp:
     def update_pose_hint(self):
         name = "A-pose" if self.pose_kind.value.startswith("A") else "T-pose"
         self.pose_hint.content = f"点击后有 **5 秒准备**。先保持 **{name} 3 秒**，再做活动范围动作或自由活动。"
+        if self.fit_hands:
+            self.pose_hint.content += "请同时包含张手、握拳、逐指弯曲和捏合。"
 
     def _mesh_visibility(self):
         if self.mesh:
             self.mesh.visible = self.show_mesh.value and self.mode == "tracking"
 
     def center_view(self, _):
+        self.view_mode = "body"
         _, packet = self.source.snapshot()
         fr = subject_frame(packet, self.selected) if packet and self.selected else None
         points = fr["pos"][fr["valid"]] if fr else np.empty((0, 3))
@@ -115,6 +141,28 @@ class FieldApp:
             client.camera.look_at = target
             client.camera.position = target + [2.8, 1.2, 3.2]
             client.camera.up_direction = (0., 1., 0.)
+
+    def show_hand(self, side):
+        if self.mode != "tracking" or self.last_result is None or self.model.num_joints != 55:
+            return
+        self.view_mode = side
+        self.update_hand_camera()
+
+    def update_hand_camera(self):
+        if self.view_mode not in ("L", "R") or self.last_result is None:
+            return
+        result = self.last_result
+        rw, joints = self.model.fk(result.R, self.rig.J_rest)
+        wrist = 20 if self.view_mode == "L" else 21
+        start = 25 if self.view_mode == "L" else 40
+        target = (joints[start:start+15].mean(0) + joints[wrist]) / 2 + result.trans
+        rotation = rw[wrist]
+        up = rotation @ np.array([1. if self.view_mode == "L" else -1., 0., 0.])
+        position = target + rotation @ np.array([0., .32, .13])
+        for client in self.server.get_clients().values():
+            client.camera.look_at = target
+            client.camera.position = position
+            client.camera.up_direction = up
 
     def change_subject(self, _):
         with self.lock:
@@ -126,7 +174,10 @@ class FieldApp:
             self.solver = self.rig = None
             self.recording = None
             self.calibration_path = None
+            self.calibration_scope = None
             self.last_result = None
+            self.last_observation = None
+            self.finger_marker_mask = None
             self.detail.content = self.base_detail
             self.mode = "preview"
             self.track_button.disabled = self.fit_button.disabled = True
@@ -148,12 +199,18 @@ class FieldApp:
             self.mode = "countdown"
             self.sample_static_pose = "a" if self.pose_kind.value.startswith("A") else "t"
             self.sample_body_regions = None if self.body_regions is None else json.loads(json.dumps(self.body_regions))
+            self.sample_fit_hands = self.fit_hands
+            self.sample_hand_prior_source = self.hand_prior_source
+            self.sample_hand_prior_sha256 = self.hand_prior_sha256
             self.countdown_end = time.perf_counter() + 5
             self.samples = []
             self.run = self.root / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ_") + uuid.uuid4().hex[:8])
             self.run.mkdir()
             self.recording = self.calibration_path = None
+            self.calibration_scope = None
             self.solver = self.rig = None
+            self.last_result = self.last_observation = None
+            self.finger_marker_mask = None
             self.track_button.disabled = self.fit_button.disabled = self.capture.disabled = True
             self.subject.disabled = self.duration.disabled = self.pose_kind.disabled = True
             self.finish.disabled = False
@@ -189,13 +246,18 @@ class FieldApp:
             self._receipt("sampled", source_fps=self.source.frame_rate, sampled_fps=fps,
                           samples=len(times), tpose_window=list(self.tpose_window), duration_seconds=float(times[-1]),
                           static_pose=self.sample_static_pose,
-                          marker_scope="body_wrist_only" if self.sample_body_regions is not None else "all_markers")
+                          marker_scope="body_hands" if self.sample_fit_hands else
+                                       "body_wrist_only" if self.sample_body_regions is not None else "all_markers",
+                          hand_prior_source=self.sample_hand_prior_source if self.sample_fit_hands else None,
+                          hand_prior_sha256=self.sample_hand_prior_sha256 if self.sample_fit_hands else None)
             self.fit_button.disabled = times[-1] < 10 or self.tpose_window[1] - self.tpose_window[0] < 5
             self.message = f"已保留 {len(times)} 帧 / {times[-1]:.1f} 秒。" + ("可以计算标定。" if not self.fit_button.disabled else "采样太短，请重新采样。")
 
     def _receipt(self, state, **extra):
         p = self.run / "session.json"
         old = json.loads(p.read_text()) if p.exists() else {}
+        if getattr(self, "calibration_scope", None) is not None:
+            extra.setdefault("marker_scope", self.calibration_scope)
         old.update(state=state, subject=self.selected, model_type=self.args.model_type,
                    source=self.args.source, coordinate_system="metres, Y-up; Vicon (x,z,-y)",
                    raw_capture_modified=False, **extra)
@@ -212,7 +274,11 @@ class FieldApp:
             metadata = self.run / "calibration_request.json"
             metadata.write_text(json.dumps({"tpose": list(self.tpose_window), "static_pose": self.sample_static_pose,
                 "source_subject": self.selected,
-                "body_regions_file": "marker_regions.json" if self.sample_body_regions is not None else None}))
+                "body_regions_file": "marker_regions.json" if self.sample_body_regions is not None else None,
+                "fit_hands": self.sample_fit_hands,
+                "hand_prior_source": self.sample_hand_prior_source if self.sample_fit_hands else None,
+                "hand_prior_sha256": self.sample_hand_prior_sha256 if self.sample_fit_hands else None,
+                "hand_pca_components": self.hand_pca_components if self.sample_fit_hands else None}))
             threading.Thread(target=self._calibrate, daemon=True).start()
 
     def _calibrate(self):
@@ -231,13 +297,53 @@ request=json.loads(Path(sys.argv[5]).read_text())
 assert request['source_subject']==sys.argv[8], 'Calibration subject association changed'
 region_file=Path(sys.argv[5]).parent/request['body_regions_file'] if request['body_regions_file'] else None
 regions=json.loads(region_file.read_text()) if region_file else None
-all_names=list(rec['names'])
-rec,regions=prepare_calibration_input(rec,regions,len(model.v_template))
-result=calibrate(model,rec,tpose=tuple(request['tpose']),static_pose=request['static_pose'],marker_regions=regions)
-np.savez(sys.argv[6],model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=request['source_subject'],
-marker_scope='body_wrist_only' if regions is not None else 'all_markers',
-marker_regions_sha256=hashlib.sha256(region_file.read_bytes()).hexdigest() if region_file else '',
-excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],dtype=str),**result)
+raw_rec=rec
+all_names=list(raw_rec['names'])
+rec,regions=prepare_calibration_input(raw_rec,regions,len(model.v_template))
+fit_hands=bool(request.get('fit_hands',False))
+prior=None
+if fit_hands:
+    if sys.argv[2]!='smplx' or model.num_joints!=55 or regions is None or len(regions)!=52:
+        raise ValueError('Full fitting requires SMPL-X55 and 52 body marker regions')
+    from vsmpl.hand_pca import HandPCA
+    prior_path=Path(request['hand_prior_source']).resolve()
+    prior_sha=hashlib.sha256(prior_path.read_bytes()).hexdigest()
+    if prior_sha!=request['hand_prior_sha256']:
+        raise ValueError('Hand prior changed since the sampling request was frozen')
+    prior=HandPCA.load(prior_path,n_components=int(request.get('hand_pca_components',12)))
+print('[field] fitting the current subject body',flush=True)
+body_result=calibrate(model,rec,tpose=tuple(request['tpose']),static_pose=request['static_pose'],marker_regions=regions)
+result=dict(body_result)
+scope='body_wrist_only' if regions is not None else 'all_markers'
+if fit_hands:
+    from vsmpl.full_calibration import calibrate_hands
+    body_saved=dict(body_result)
+    body_saved.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,
+                      source_subject=request['source_subject'],marker_scope='body_wrist_only')
+    np.savez(Path(sys.argv[6]).with_name('body_calib.npz'),**body_saved)
+    clock_path=Path(sys.argv[5]).parent/'sampling_clock.npz'
+    with np.load(clock_path,allow_pickle=False) as clock:
+        frames=clock['source_frame_numbers'].copy()
+        times=clock['relative_host_arrival_seconds'].copy()
+    if len(frames)!=len(raw_rec['pos']) or len(times)!=len(raw_rec['pos']) or not np.isfinite(times).all():
+        raise ValueError('Sampling clock does not match the full source recording')
+    print('[field] fitting native SMPL-X hands on the complete source markers',flush=True)
+    result,report=calibrate_hands(model,raw_rec,body_result,prior,regions,frame_numbers=frames,times=times)
+    result=dict(result)
+    if str(result.get('marker_scope',''))!='body_hands':
+        raise ValueError('Full hand fitting returned an unexpected scope')
+    def json_value(value):
+        if isinstance(value,np.ndarray):return value.tolist()
+        if isinstance(value,np.generic):return value.item()
+        raise TypeError(type(value).__name__)
+    (Path(sys.argv[6]).parent/'hand_calibration_report.json').write_text(
+        json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False,default=json_value))
+    result.update(hand_prior_source=str(prior_path),hand_prior_sha256=prior_sha)
+    scope='body_hands'
+result.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=request['source_subject'],
+marker_scope=scope,marker_regions_sha256=hashlib.sha256(region_file.read_bytes()).hexdigest() if region_file else '',
+excluded_marker_names=np.array([n for n in all_names if n not in set(map(str,result['marker_names']))],dtype=str))
+np.savez(sys.argv[6],**result)
 """
         try:
             with (self.run / "calibration.log").open("w") as log:
@@ -263,10 +369,31 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
 
     def _load_calibration(self, path):
         with np.load(path, allow_pickle=False) as calib:
-            self.rig = MarkerRig.from_calibration(self.model, calib)
+            rig = MarkerRig.from_calibration(self.model, calib)
             residual = calib["per_marker_rms"] * 1000
             scope = str(calib["marker_scope"]) if "marker_scope" in calib else "all_markers"
-        self.solver = RealtimeSolver(self.rig)
+            if scope == "body_hands":
+                configured = getattr(self.args, "hand_prior", None)
+                prior_source = configured or (str(calib["hand_prior_source"]) if "hand_prior_source" in calib else None)
+                if not prior_source or "hand_prior_sha256" not in calib:
+                    raise ValueError("Full calibration is missing its hand prior provenance")
+                prior_path = Path(prior_source).resolve()
+                if hashlib.sha256(prior_path.read_bytes()).hexdigest() != str(calib["hand_prior_sha256"]):
+                    raise ValueError("Hand prior SHA256 does not match the saved calibration")
+                prior = HandPCA.load(prior_path, n_components=int(calib["hand_pca_components"]))
+                solver = PCASolver(rig, prior, initial_latent=calib["hand_pca_initial_latent"],
+                                   hand_prior_weight=float(calib["hand_prior_weight"]))
+                fingers = [str(name) for name in calib["finger_marker_names"]]
+                if rig.num_markers != 72 or len(set(fingers)) != 20 or not set(fingers).issubset(rig.names):
+                    raise ValueError("Full calibration does not contain 72 markers and 20 finger labels")
+                finger_mask = np.isin(rig.names, fingers)
+            else:
+                solver = RealtimeSolver(rig)
+                finger_mask = None
+        self.rig, self.solver = rig, solver
+        self.calibration_scope = scope
+        self.finger_marker_mask = finger_mask
+        self.last_observation = None
         self.mapper = NameMapper(self.rig.names)
         self.detail.content = f"标定 marker {len(residual)} 个；残差中位数 **{np.median(residual):.1f} mm**，最大 **{residual.max():.1f} mm**。请检查明显偏大的点及朝向。"
         high = [name for name, error in zip(self.rig.names, residual) if error > 30]
@@ -274,6 +401,22 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
             self.detail.content += "\n\n**候选存在较大残差，尚未验收：** " + "、".join(high)
         if scope == "body_wrist_only":
             self.detail.content += "\n\n**此候选仅标定身体与手腕，手指 marker 未参与；手指姿态不代表测量结果。**"
+        elif scope == "body_hands":
+            self.detail.content += (f"\n\n**SMPL-X 身体＋双手 72 点**。身体点残差中位数 "
+                                    f"**{np.median(residual[~finger_mask]):.1f} mm**；手指点 "
+                                    f"**{np.median(residual[finger_mask]):.1f} mm**。手指使用学习手形先验约束，尚待真人近景检查。")
+
+    def _group_marker_rms(self):
+        if self.finger_marker_mask is None or self.last_result is None or self.last_observation is None:
+            return None
+        obs, valid = self.last_observation
+        pred = self.rig.forward(self.last_result.R, self.last_result.trans)
+        finite = valid & np.isfinite(obs).all(-1) & np.isfinite(pred).all(-1)
+        error = np.linalg.norm(pred - obs, axis=1)
+        def rms(mask):
+            values = error[mask & finite]
+            return float(np.sqrt(np.mean(values ** 2)) * 1000) if len(values) else None
+        return dict(body_mm=rms(~self.finger_marker_mask), finger_mm=rms(self.finger_marker_mask))
 
     def start_tracking(self, _):
         with self.lock:
@@ -290,6 +433,7 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
                                              self.source.frame_rate)
             self.fit_count = 0
             self.last_result = None
+            self.last_observation = None
             self.mode = "tracking"
             self.track_button.disabled = self.capture.disabled = self.subject.disabled = self.pose_kind.disabled = True
             self.stop_button.disabled = False
@@ -334,6 +478,7 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
                             elif self.mode == "tracking":
                                 pos, valid = self.mapper(fr)
                                 self.last_result = self.solver.step(pos, valid, frame_no=fr["frame"])
+                                self.last_observation = (pos.copy(), valid.copy())
                                 res = self.last_result
                                 self.recorder.add(fr["frame"], res.pose_aa, res.trans, res.rmse)
                                 self.fit_count += 1
@@ -357,6 +502,8 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
                                 self.mesh.vertices = verts
                         if self.mesh:
                             self.mesh.visible = visible and self.show_mesh.value
+                        if visible and self.view_mode != "body":
+                            self.update_hand_camera()
                     if now - ui_time > 0.25:
                         ui_time = now
                         subjects = tuple(s["name"] for s in packet["subjects"] if len(s["markers"]) >= 15) if packet else ()
@@ -377,15 +524,25 @@ excluded_marker_names=np.array([n for n in all_names if n not in rec['names']],d
                         visible_count = int(fr["valid"].sum()) if fr and age < 1 else 0
                         connection = f"{self.source.frame_rate:.0f} Hz · 数据年龄 {age*1000:.0f} ms" if age < 1 else "等待新数据 · " + self.source.error
                         stats = ""
+                        groups = None
                         if self.mode == "tracking" and self.last_result:
                             r = self.last_result
                             stats = f"\n\n求解 **{r.ms:.2f} ms** · marker RMSE **{r.rmse*1000:.1f} mm** · {r.status} · 已输出 {self.fit_count} 帧"
+                            groups = self._group_marker_rms()
+                            if groups is not None:
+                                def display(value):
+                                    return "—" if value is None else f"{value:.1f} mm"
+                                stats += f"\n\n可见点 RMS · 身体 **{display(groups['body_mm'])}** · 手指 **{display(groups['finger_mm'])}**"
                         self.status.content = f"**{connection}**\n\n可见 marker **{visible_count}** · {self.selected or '未选择被试'}\n\n{phase}{stats}"
                         receipt = dict(mode=self.mode, subject=self.selected, source=self.args.source,
                                        source_fps=self.source.frame_rate, frame=packet["frame"] if packet else None,
                                        age_ms=round(age*1000, 1) if np.isfinite(age) else None,
                                        subjects=list(subjects), visible_markers=visible_count, message=phase,
-                                       solved_frames=self.fit_count, raw_capture_modified=False)
+                                       solved_frames=self.fit_count, raw_capture_modified=False,
+                                       marker_scope=self.calibration_scope,
+                                       body_marker_rms_mm=groups["body_mm"] if groups else None,
+                                       finger_marker_rms_mm=groups["finger_mm"] if groups else None,
+                                       solver_status=self.last_result.status if self.mode == "tracking" and self.last_result else None)
                         target = self.root / "status.json"
                         temp = target.with_suffix(".tmp")
                         temp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -411,6 +568,9 @@ def main():
     parser.add_argument("--calib", help="load a separately reviewed calibration candidate without resampling")
     parser.add_argument("--subject", help="explicit subject associated with --calib")
     parser.add_argument("--body-regions", help="validated body/wrist region JSON; freeze per sample and exclude other markers from fitting")
+    parser.add_argument("--fit-hands", action="store_true", help="fit body and both articulated hands using the complete source markers")
+    parser.add_argument("--hand-prior", help="licensed native SMPL-X hand PCA prior for --fit-hands/full saved calibration")
+    parser.add_argument("--hand-components", type=int, default=12, help="hand PCA coefficients per side for new full calibrations")
     FieldApp(parser.parse_args()).loop()
 
 

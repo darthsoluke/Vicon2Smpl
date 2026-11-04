@@ -17,6 +17,13 @@ if HAVE_NUMBA:
 # SMPL / SMPL-X share the first 22 body joints.
 TORSO_JOINTS = (0, 3, 6, 9)  # pelvis, spine1, spine2, spine3
 
+# d exp(delta) / d delta_a at zero, for local right rotation increments.
+_RIGHT_ROTATION_GENERATORS = np.array([
+    [[0., 0., 0.], [0., 0., -1.], [0., 1., 0.]],
+    [[0., 0., 1.], [0., 0., 0.], [-1., 0., 0.]],
+    [[0., -1., 0.], [1., 0., 0.], [0., 0., 0.]],
+])
+
 
 class BodyModel:
     def __init__(self, v_template, shapedirs, posedirs, J_regressor, weights, parents, faces, model_type="smpl"):
@@ -143,6 +150,7 @@ class MarkerRig:
     vertex_ids: np.ndarray  # (M,)
     offsets: np.ndarray  # (M,3) rest-space offset from the surface vertex
     betas: np.ndarray
+    include_pose_derivatives: bool = False
     p_rest: np.ndarray = field(init=False)
     W: np.ndarray = field(init=False)
     PD: np.ndarray = field(init=False)
@@ -158,6 +166,7 @@ class MarkerRig:
         self.W = np.ascontiguousarray(self.model.weights[self.vertex_ids])  # (M,J)
         self.PD = self.model.posedirs[:, self.vertex_ids]  # (P,M,3)
         self._PD2 = np.ascontiguousarray(self.PD.reshape(len(self.PD), -1))  # (P, M*3)
+        self._PD_blocks = self._PD2.reshape(self.model.num_joints - 1, 9, len(self.names), 3)
     @classmethod
     def from_calibration(cls, model, calib):
         return cls(model, [str(n) for n in calib["marker_names"]], calib["vertex_ids"], calib["offsets"], calib["betas"])
@@ -185,10 +194,14 @@ class MarkerRig:
 
     def jacobian(self, cache, joints):
         """d marker / d (local right-increment of R[j]) for j in `joints`, and d/d trans.
-        Returns (M,3,len(joints)*3 + 3). Pose blendshape derivatives are ignored (Gauss-Newton approx)."""
+        Returns (M,3,len(joints)*3 + 3). The default preserves the approximation that ignores
+        pose blendshape derivatives; set include_pose_derivatives=True to include their direct term."""
         Rw, c, q = cache
         if HAVE_NUMBA:
-            return jacobian_nb(Rw, c, q, self.W, self.model.subtree, np.asarray(joints, np.int64))
+            out = jacobian_nb(Rw, c, q, self.W, self.model.subtree, np.asarray(joints, np.int64))
+            if self.include_pose_derivatives:
+                self._add_pose_derivatives(out, Rw, joints)
+            return out
         D = self.model.subtree[joints]  # (K,J)
         M = len(q)
         wq = self.W[:, :, None] * q  # (M,J,3)
@@ -207,7 +220,27 @@ class MarkerRig:
         out = np.empty((M, 3, Jp.shape[-1] + 3))
         out[..., :-3] = Jp
         out[..., -3:] = np.eye(3)
+        if self.include_pose_derivatives:
+            self._add_pose_derivatives(out, Rw, joints)
         return out
+
+    def _add_pose_derivatives(self, out, Rw, joints):
+        """Add TR_m * d pose_offset_m / d delta_j, without numerical differencing."""
+        active = np.asarray(joints, dtype=np.int64)
+        slots = np.flatnonzero(active != 0)
+        if not len(slots):
+            return
+        selected = active[slots]
+        # Pose features use each non-root local R_j, not the accumulated world rotation.
+        parents = self.model.parents[selected]
+        local = np.transpose(Rw[parents], (0, 2, 1)) @ Rw[selected]
+        d_feature = (local[:, None] @ _RIGHT_ROTATION_GENERATORS[None]).reshape(len(selected), 3, 9)
+        # (marker, rest-coordinate, active-joint, increment-axis)
+        d_rest = np.einsum("kap,kpmc->mcka", d_feature, self._PD_blocks[selected - 1], optimize=True)
+        blended = (self.W @ Rw.reshape(len(Rw), 9)).reshape(self.num_markers, 3, 3)
+        d_world = np.einsum("muc,mcka->muka", blended, d_rest, optimize=True)
+        blocks = out[..., :-3].reshape(self.num_markers, 3, len(active), 3)
+        blocks[:, :, slots, :] += d_world
 
     def joint_observability(self):
         """Max over markers of |d marker / d rotation| (m/rad) for each joint at rest pose."""

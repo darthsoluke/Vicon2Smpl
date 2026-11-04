@@ -72,3 +72,24 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=
 网页新采样使用 `--body-regions` 指向已核对的 52 点身体/手腕区域定义；该文件只描述模型拓扑上的身体部位，
 不携带 `st` 的 beta、offset 或对应顶点结果。每段另存区域快照，新人物重新求解。
 完整 72 点来源采样继续保留，worker 仅选 52 点参与拟合。
+
+## 身体、手腕和手指
+
+操作者随后明确要求 SMPL-X 的身体、手腕和手指一起拟合。保留 `zhr` 原52点身体候选与来源采样，
+全身候选另存该段 `derived/full_body_hands_20261104_*`，不覆盖已有结果。
+标签语义来自采集项目 `desktop/preview_widgets.cpp:53` 和其 operator contract 测试：
+`3/MID0` 近掌、`6` 近指尖，IWR/OWR在腕、IHAND/OHAND在手背两侧。
+
+使用既有 `/data2/DEV/soma/support_files/smplx/pose_hand_prior.npz` 学习手形先验，
+通过 PCA 参数化原生55关节中的两手，保留完整父链、蒙皮权重和姿态形变。
+身体0–21与手指25–54参与求解；22–24无观测而冻结。
+不是把手部单独裁权重或将 MANO 网格拼到身体上。
+手形先验、marker部位约束、贴点偏移边界和时间平滑均为调用方先验，不构成独立指节真值。
+
+当前全身测试候选为 `zhr` 段下 `derived/full_body_hands_20261104_v3_pca20/subject_calib_full.npz`。
+每手使用20个学习手形系数；身体体型及52点贴点参数与该人已完成的身体标定一致，
+姿态在72点上联合细化。45秒来源的9003帧回放为1次初始化、9002次跟踪，
+求解中位数6.33ms、p99 8.58ms；可见marker RMS中位数为身体5.59mm、手指7.89mm。
+该回放验证动态求解及点位贴合，不是独立手指关节真值验收。
+真实55关节/非零pose blendshape的降维Jacobian抽查误差最大2.74e-8，手部PCA状态未越过旋转对数主值分支。
+原52点身体拟合与原始采样保留；切换前先保存正在运行的身体拟合输出。
