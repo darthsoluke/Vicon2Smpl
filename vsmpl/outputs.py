@@ -40,11 +40,32 @@ class UdpPublisher:
 class SequenceRecorder:
     """Collects solved frames and saves an AMASS-like npz (poses / trans / betas / mocap_framerate)."""
 
-    def __init__(self, model_type, gender, betas, fps):
+    def __init__(self, model_type, gender, betas, fps, model=None):
+        """SOMA stores public SOMALayer inputs plus its bind-relative solver parameters.
+
+        SMPL-family models and callers without `model` retain the original fields
+        and keep just one pose/translation copy in memory.
+        """
         self.meta = dict(model_type=model_type, gender=gender, betas=np.asarray(betas), mocap_framerate=float(fps or 0))
+        backend = getattr(model, "model_type", None)
+        if model is not None and (model_type == "soma" or backend == "soma") and backend != model_type:
+            raise ValueError("SOMA recorder model_type must match the supplied body model")
+        # BodyModel.public_pose is a no-op for every SMPL-family model; merely
+        # having that method must not enable a redundant solver-pose recording.
+        self.model = model if backend == "soma" else None
+        if self.model is not None:
+            self.meta.update(self.model.recording_metadata(betas))
+            self.solver_poses, self.solver_trans = [], []
         self.poses, self.trans, self.frames, self.rmse = [], [], [], []
 
     def add(self, frame_no, pose_aa, trans, rmse):
+        if self.model is not None:
+            public_pose, public_trans = self.model.public_pose(pose_aa, trans)
+            if np.shape(public_pose) != (77, 3) or np.shape(public_trans) != (3,):
+                raise ValueError("SOMA public output must contain 77 joint rotations and one 3D Hips position")
+            self.solver_poses.append(np.asarray(pose_aa, np.float32).reshape(-1))
+            self.solver_trans.append(np.asarray(trans, np.float32))
+            pose_aa, trans = public_pose, public_trans
         self.poses.append(np.asarray(pose_aa, np.float32).reshape(-1))
         self.trans.append(np.asarray(trans, np.float32))
         self.frames.append(frame_no)
@@ -52,6 +73,9 @@ class SequenceRecorder:
 
     def save(self, path):
         poses = np.array(self.poses)
+        extra = {}
+        if self.model is not None and self.solver_poses:
+            extra = dict(solver_poses=np.array(self.solver_poses), solver_trans=np.array(self.solver_trans))
         np.savez(path, poses=poses, root_orient=poses[:, :3], trans=np.array(self.trans), frame_numbers=np.array(self.frames), rmse=np.array(self.rmse),
-                 **self.meta)
+                 **self.meta, **extra)
         return len(poses)

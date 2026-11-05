@@ -26,17 +26,36 @@ _RIGHT_ROTATION_GENERATORS = np.array([
 
 
 class BodyModel:
-    def __init__(self, v_template, shapedirs, posedirs, J_regressor, weights, parents, faces, model_type="smpl"):
+    """SMPL-form body: rest frames are world-aligned, so the rest pose is all-identity rotations.
+
+    Two optional generalisations (used by the SOMA backend, see soma_model.py) keep SMPL behaviour unchanged:
+      * posedirs=None: no pose-corrective blendshapes (pure LBS);
+      * J_template/J_shapedirs: rest joints given directly as J_template + J_shapedirs @ betas instead of
+        J_regressor @ vertices.
+    """
+
+    # Skeleton roles used by initialisation and priors (SMPL / SMPL-H / SMPL-X joint numbering).
+    torso_joints = TORSO_JOINTS
+    head_joint = 15
+    rest_is_tpose = True  # rotations = identity reproduces the T-pose
+    joint_names = None
+
+    def __init__(self, v_template, shapedirs, posedirs, J_regressor, weights, parents, faces, model_type="smpl",
+                 J_template=None, J_shapedirs=None):
         self.v_template = np.asarray(v_template, np.float64)  # (V,3)
         self.shapedirs = np.asarray(shapedirs, np.float64)  # (V,3,B)
-        self.posedirs = np.asarray(posedirs, np.float64)  # (P,V,3)
-        self.J_regressor = np.asarray(J_regressor, np.float64)  # (J,V)
+        self.posedirs = None if posedirs is None else np.asarray(posedirs, np.float64)  # (P,V,3)
+        self.J_regressor = None if J_regressor is None else np.asarray(J_regressor, np.float64)  # (J,V)
+        self.J_template = None if J_template is None else np.asarray(J_template, np.float64)  # (J,3)
+        self.J_shapedirs = None if J_shapedirs is None else np.asarray(J_shapedirs, np.float64)  # (J,3,B)
+        if self.J_regressor is None and (self.J_template is None or self.J_shapedirs is None):
+            raise ValueError("Rest joints need either J_regressor or J_template + J_shapedirs")
         self.weights = np.asarray(weights, np.float64)  # (V,J)
         self.parents = np.asarray(parents, np.int64).copy()
         self.parents[0] = -1
         self.faces = np.asarray(faces, np.int64)
         self.model_type = model_type
-        self.num_joints = self.J_regressor.shape[0]
+        self.num_joints = (self.J_template if self.J_regressor is None else self.J_regressor).shape[0]
         self.num_betas = self.shapedirs.shape[-1]
         # subtree[j, k] = 1 if k is j or a descendant of j
         J = self.num_joints
@@ -56,8 +75,17 @@ class BodyModel:
 
     # ------------------------------------------------------------------ loading
     @classmethod
-    def load(cls, model_path, model_type="smpl", gender="neutral", num_betas=10):
-        """Load through the `smplx` package (supports .pkl / .npz model files)."""
+    def load(cls, model_path, model_type="smpl", gender="neutral", num_betas=10, soma_lod="mid",
+             soma_identity="soma"):
+        """Load through the `smplx` package (supports .pkl / .npz model files), or NVIDIA SOMA for
+        model_type="soma" (model_path = SOMA asset folder, or "hf" for the HuggingFace cache)."""
+        if model_type == "soma":
+            from .soma_model import SomaBodyModel
+            kwargs = None
+            if soma_identity in ("smpl", "smplh", "smplx"):
+                kwargs = dict(model_path=model_path, gender=gender)  # licensed SMPL files for that identity backend
+            return SomaBodyModel.load(None if soma_identity != "soma" else model_path, num_betas=num_betas,
+                                      lod=soma_lod, identity_model_type=soma_identity, identity_model_kwargs=kwargs)
         from pathlib import Path
         if Path(model_path).is_file() and str(model_path).lower().endswith(".npz"):
             # Geometry-only MoSh support models lack hand PCA metadata required by smplx.create,
@@ -95,7 +123,32 @@ class BodyModel:
         betas = np.asarray(betas, np.float64).ravel()[: self.num_betas]
         b[: len(betas)] = betas
         v = self.v_template + self.shapedirs @ b
+        if self.J_regressor is None:
+            return v, self.J_template + self.J_shapedirs @ b
         return v, self.J_regressor @ v
+
+    def posedirs_at(self, vertex_ids):
+        """Pose blendshapes (P,len(ids),3) of selected vertices; zeros for a model without correctives."""
+        vertex_ids = np.asarray(vertex_ids, np.int64)
+        if self.posedirs is None:
+            return np.zeros(((self.num_joints - 1) * 9, len(vertex_ids), 3))
+        return self.posedirs[:, vertex_ids]
+
+    # ------------------------------------------------------------------ backend hooks (no-ops for SMPL)
+    def prepare_for(self, betas):
+        """Called before building a rig for `betas` (SOMA re-linearises its identity model there)."""
+
+    def public_pose(self, pose_aa, trans):
+        """Solver parameters -> the model's published convention. SMPL: unchanged (pose (J,3), trans)."""
+        return np.asarray(pose_aa), np.asarray(trans)
+
+    def calibration_metadata(self):
+        """Extra fields stored in a calibration file so the same model can be rebuilt later."""
+        return {}
+
+    def recording_metadata(self, betas):
+        """Extra fields stored with a solved sequence (published convention, identity)."""
+        return {}
 
     def vertex_normals(self, v):
         f = self.faces
@@ -130,7 +183,7 @@ class BodyModel:
     def vertices(self, R, trans, v_rest, J_rest):
         """Full mesh (for visualisation)."""
         Rw, c = self.fk(R, J_rest)
-        v = v_rest + np.einsum("p,pvc->vc", self.pose_feature(R), self.posedirs)
+        v = v_rest if self.posedirs is None else v_rest + np.einsum("p,pvc->vc", self.pose_feature(R), self.posedirs)
         At = c - np.einsum("jab,jb->ja", Rw, J_rest)  # (J,3)
         T_R = np.einsum("vj,jab->vab", self.weights, Rw)
         T_t = self.weights @ At
@@ -164,11 +217,13 @@ class MarkerRig:
         self.v_rest, self.J_rest = self.model.shaped(self.betas)
         self.p_rest = np.ascontiguousarray(self.v_rest[self.vertex_ids] + self.offsets)
         self.W = np.ascontiguousarray(self.model.weights[self.vertex_ids])  # (M,J)
-        self.PD = self.model.posedirs[:, self.vertex_ids]  # (P,M,3)
+        self.has_posedirs = self.model.posedirs is not None
+        self.PD = self.model.posedirs_at(self.vertex_ids)  # (P,M,3)
         self._PD2 = np.ascontiguousarray(self.PD.reshape(len(self.PD), -1))  # (P, M*3)
         self._PD_blocks = self._PD2.reshape(self.model.num_joints - 1, 9, len(self.names), 3)
     @classmethod
     def from_calibration(cls, model, calib):
+        model.prepare_for(calib["betas"])
         return cls(model, [str(n) for n in calib["marker_names"]], calib["vertex_ids"], calib["offsets"], calib["betas"])
 
     @property
@@ -179,7 +234,7 @@ class MarkerRig:
         """Marker positions (M,3). If with_cache also returns quantities needed for the Jacobian."""
         m = self.model
         Rw, c = m.fk(R, self.J_rest)
-        p = self.p_rest + (m.pose_feature(R) @ self._PD2).reshape(-1, 3)
+        p = self.p_rest + (m.pose_feature(R) @ self._PD2).reshape(-1, 3) if self.has_posedirs else self.p_rest
         if HAVE_NUMBA:
             out, q = skin_nb(Rw, c, self.J_rest, p, self.W, np.asarray(trans, np.float64), with_cache)
             return (out, (Rw, c, q)) if with_cache else out
@@ -226,6 +281,8 @@ class MarkerRig:
 
     def _add_pose_derivatives(self, out, Rw, joints):
         """Add TR_m * d pose_offset_m / d delta_j, without numerical differencing."""
+        if not self.has_posedirs:
+            return
         active = np.asarray(joints, dtype=np.int64)
         slots = np.flatnonzero(active != 0)
         if not len(slots):

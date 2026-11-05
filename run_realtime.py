@@ -19,7 +19,13 @@ from vsmpl.sources import NameMapper, ReplaySource, ViconSource
 def build(calib_path, model_path, solver_kw=None, model=None):
     calib = np.load(calib_path, allow_pickle=False)
     if model is None:
-        model = BodyModel.load(model_path, str(calib["model_type"]), str(calib["gender"]), int(calib["num_betas"]))
+        soma_kw = dict(soma_lod=str(calib["soma_lod"]), soma_identity=str(calib["soma_identity_model"])) \
+            if "soma_lod" in calib else {}
+        model = BodyModel.load(model_path, str(calib["model_type"]), str(calib["gender"]), int(calib["num_betas"]),
+                               **soma_kw)
+    if str(calib["model_type"]) == "soma" or model.model_type == "soma":
+        from vsmpl.soma_model import check_calibration_model
+        check_calibration_model(model, calib)
     rig = MarkerRig.from_calibration(model, calib)
     cfg = SolverConfig(**(solver_kw or {}))
     solver = RealtimeSolver(rig, cfg)
@@ -77,7 +83,7 @@ def main():
     rec = None
     if args.save:
         from vsmpl.outputs import SequenceRecorder
-        rec = SequenceRecorder(str(calib["model_type"]), str(calib["gender"]), calib["betas"], 0)
+        rec = SequenceRecorder(str(calib["model_type"]), str(calib["gender"]), calib["betas"], 0, model=model)
 
     seq, last_frame, dropped, n = -1, None, 0, 0
     stats_t, ms_hist, rmse_hist = time.time(), [], []
@@ -103,7 +109,7 @@ def main():
             if viz:
                 viz.push(res.R, res.trans, pos, valid)
             if udp:
-                udp.send(fr["frame"], fr["time"], pose, res.trans, res.rmse)
+                udp.send(fr["frame"], fr["time"], *model.public_pose(pose, res.trans), res.rmse)
             if rec:
                 rec.add(fr["frame"], pose, res.trans, res.rmse)
             if time.time() - stats_t > 2.0:

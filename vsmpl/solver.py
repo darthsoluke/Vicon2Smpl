@@ -70,7 +70,7 @@ class RealtimeSolver:
         self.prior_w[active == 0] = 0.0
         # torso markers for Kabsch (dominant joint in torso set)
         dom = np.argmax(rig.W, axis=1)
-        self.torso_markers = np.isin(dom, TORSO_JOINTS)
+        self.torso_markers = np.isin(dom, getattr(rig.model, "torso_joints", TORSO_JOINTS))
         self.reset()
 
     # -------------------------------------------------------------- state
