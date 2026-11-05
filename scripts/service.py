@@ -133,6 +133,8 @@ def load_config(path):
         raise ServiceError("num_betas must be a positive integer")
     if cfg["soma_lod"] not in {"mid", "low", "xlo"} or cfg["soma_identity"] not in {"soma", "smpl", "smplx"}:
         raise ServiceError("Invalid SOMA LOD or identity model")
+    if cfg["model_type"] == "soma" and cfg["soma_identity"] != "soma":
+        raise ServiceError("licensed identity 仅实验 CLI；部署 profile 需 native soma 本地 assets")
     if type(cfg["fit_hands"]) is not bool:
         raise ServiceError("fit_hands must be a JSON boolean")
     if type(cfg["hand_components"]) is not int or not 1 <= cfg["hand_components"] <= 45:

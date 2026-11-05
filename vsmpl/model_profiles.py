@@ -144,6 +144,8 @@ def _normalise(raw, base, validate_paths, legacy=False):
     _integer(profile["hand_components"], "hand_components", 45)
     _choice(profile["soma_lod"], "soma_lod", ("mid", "low", "xlo"))
     _choice(profile["soma_identity"], "soma_identity", ("soma", "smpl", "smplx"))
+    if model_type == "soma" and not legacy and profile["soma_identity"] != "soma":
+        raise ProfileError("licensed identity 仅实验 CLI；部署 profile 需 native soma 本地 assets")
     if type(profile["fit_hands"]) is not bool:
         raise ProfileError("fit_hands must be a JSON boolean")
     if profile["fit_hands"] and model_type != "smplx":

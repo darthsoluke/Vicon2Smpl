@@ -151,6 +151,15 @@ class ServiceTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertIn("local assets", self.cli("preflight", success=False)["error"])
 
+    def test_service_soma_rejects_experimental_licensed_identity(self):
+        (self.root / "soma-assets").mkdir()
+        for identity in ("smpl", "smplx"):
+            self.cfg.update(model_type="soma", model_path="soma-assets", soma_identity=identity)
+            self.write_config()
+            with self.subTest(identity=identity):
+                self.assertIn("licensed identity", self.cli("preflight", success=False)["error"])
+        self.assertFalse((self.root / "output/starts").exists())
+
     def test_profile_default_binds_actual_child_arguments_without_numpy(self):
         (self.root / "soma-assets").mkdir()
         profiles = [dict(id="smplx", label="SMPL-X", model_type="smplx", model_path="model.npz"),
@@ -221,9 +230,15 @@ class ServiceTests(unittest.TestCase):
                     with patch.object(health.platform, "system", return_value="Linux"):
                         with patch.object(health.platform, "platform", return_value="fixture Linux"):
                             report = health.check(self.config)
+                            self.cfg.pop("model_profiles")
+                            self.cfg.update(model_type="soma", model_path="soma-assets", soma_identity="smplx")
+                            self.write_config()
+                            rejected = health.check(self.config)
         self.assertEqual(report["status"], "PASS", report)
         self.assertFalse(report["hardware_connection_opened"])
         self.assertEqual(len(calls), 2)
+        self.assertEqual(rejected["status"], "FAIL")
+        self.assertIn("licensed identity", next(item for item in rejected["checks"] if item["name"] == "model_profiles")["detail"])
         self.assertEqual(calls[0][1], dict(num_betas=12, soma_lod="low", soma_identity="soma"))
         self.assertEqual(calls[1][1], dict(num_betas=10))
         default = next(item for item in report["checks"] if item["name"] == "licensed_model_and_marker_regions")

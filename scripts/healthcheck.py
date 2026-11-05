@@ -50,6 +50,9 @@ def check(config_path, *, skip_model=False):
         from vsmpl.model_profiles import load_profiles, profile_signature
         legacy = dict(config)
         legacy.setdefault("model_type", "smplx")
+        if (not config.get("model_profiles") and legacy["model_type"] == "soma"
+                and legacy.get("soma_identity", "soma") != "soma"):
+            raise ValueError("licensed identity 仅实验 CLI；部署 profile 需 native soma 本地 assets")
         for key in ("model_path", "body_regions", "hand_prior", "calib"):
             if config.get(key):
                 legacy[key] = str(path(key))

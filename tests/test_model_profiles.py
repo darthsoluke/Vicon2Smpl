@@ -97,6 +97,18 @@ class ModelProfileTests(unittest.TestCase):
         _, profiles = self.load([self.profile(calib="calib.npz", subject="actor")])
         self.assertEqual(profiles["smplx"]["subject"], "actor")
 
+    def test_deployed_soma_requires_native_identity_but_legacy_cli_keeps_experiments(self):
+        for identity in ("smpl", "smplx"):
+            raw = self.profile(model_type="soma", model_path="soma-assets", fit_hands=False,
+                               hand_prior=None, soma_identity=identity)
+            for validate in (True, False):
+                with self.subTest(identity=identity, validate=validate), self.assertRaisesRegex(ProfileError, "licensed identity"):
+                    self.load([raw], validate_paths=validate)
+            self.args.model_type, self.args.model_path = "soma", str(self.root / "model.npz")
+            self.args.soma_identity = identity
+            _, profiles = load_profiles(None, self.args)
+            self.assertEqual(profiles["default"]["soma_identity"], identity)
+
     def test_apply_profile_never_changes_source_namespace_or_other_profile(self):
         _, profiles = self.load()
         before = copy.deepcopy(vars(self.args))

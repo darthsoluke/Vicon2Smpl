@@ -27,6 +27,19 @@ from vsmpl.model_profiles import load_profiles, apply_profile_args, profile_requ
 IDLE_MODES = frozenset(("preview", "calibrated"))
 
 
+def soma_finger_joints(model):
+    """SOMA user-joint IDs below the named wrists; never reuse SMPL-X indices."""
+    names = getattr(model, "joint_names", None)
+    if names is None or len(names) != model.num_joints:
+        raise ValueError("SOMA body/wrist fitting requires its named public skeleton")
+    fingers = [j for j, name in enumerate(names)
+               if any(str(name).startswith(wrist) and str(name) != wrist
+                      for wrist in ("LeftHand", "RightHand"))]
+    if not fingers:
+        raise ValueError("SOMA body/wrist fitting could not identify the finger joints")
+    return fingers
+
+
 class FieldApp:
     def __init__(self, args):
         import viser
@@ -450,6 +463,8 @@ class FieldApp:
                       hand_prior_source=self.hand_prior_source,
                       hand_prior_sha256=self.hand_prior_sha256,
                       hand_pca_components=self.hand_pca_components)
+        if self.profiles_enabled and profile["model_type"] == "soma":
+            frozen.update(fixed_joints=soma_finger_joints(self.model), fitting_scope="body_wrist_only")
         verify_profile_files(frozen)
         return frozen
 
@@ -596,6 +611,7 @@ from vsmpl.calibration import calibrate
 from vsmpl.calibration_input import prepare_calibration_input
 from vsmpl.sources import load_recording
 from vsmpl.model_profiles import verify_profile_files
+from run_web import soma_finger_joints
 request=json.loads(Path(sys.argv[5]).read_text())
 if 'hand_prior' not in request and request.get('hand_prior_source'):
     request['hand_prior']=request['hand_prior_source']
@@ -626,8 +642,17 @@ if fit_hands:
         raise ValueError('Hand prior changed since the sampling request was frozen')
     prior=HandPCA.load(prior_path,n_components=int(request.get('hand_pca_components',12)))
 print('[field] fitting the current subject body',flush=True)
-body_result=calibrate(model,rec,tpose=tuple(request['tpose']),static_pose=request['static_pose'],marker_regions=regions)
+fitting_args={}
+if sys.argv[2]=='soma' and request.get('fixed_joints') is not None:
+    expected_fixed=soma_finger_joints(model)
+    if request.get('fixed_joints')!=expected_fixed or request.get('fitting_scope')!='body_wrist_only' or regions is None:
+        raise ValueError('SOMA frozen body/wrist fitting configuration does not match its skeleton/regions')
+    fitting_args['fixed_joints']=expected_fixed
+body_result=calibrate(model,rec,tpose=tuple(request['tpose']),static_pose=request['static_pose'],marker_regions=regions,**fitting_args)
 result=dict(body_result)
+if fitting_args:
+    result.update(fitting_fixed_joints=np.asarray(fitting_args['fixed_joints'],dtype=np.int64),
+                  fitting_scope='body_wrist_only')
 scope='body_wrist_only' if regions is not None else 'all_markers'
 if fit_hands:
     from vsmpl.full_calibration import calibrate_hands
@@ -706,6 +731,9 @@ np.savez(sys.argv[6],**result)
                 raise ValueError("Saved calibration subject does not match the selected actor")
             if "model_type" in calib and expected_type is not None and str(calib["model_type"]) != expected_type:
                 raise ValueError("Saved calibration body model does not match the active model")
+            expected_gender = getattr(self.args, "gender", None)
+            if "gender" in calib and expected_gender is not None and str(calib["gender"]) != expected_gender:
+                raise ValueError("Saved calibration gender does not match the active model gender")
             if "betas" in calib and hasattr(self.model, "num_betas"):
                 if calib["betas"].shape != (self.model.num_betas,) or not np.isfinite(calib["betas"]).all():
                     raise ValueError("Calibration identity coefficient dimensions do not match the active model")
@@ -716,9 +744,27 @@ np.savez(sys.argv[6],**result)
             if getattr(self.model, "model_type", None) == "soma" or ("model_type" in calib and str(calib["model_type"]) == "soma"):
                 from vsmpl.soma_model import check_calibration_model
                 compatibility = check_calibration_model(self.model, calib)
+            scope = str(calib["marker_scope"]) if "marker_scope" in calib else "all_markers"
+            soma_fixed = None
+            if strict and expected_type == "soma":
+                if scope != "body_wrist_only":
+                    raise ValueError("SOMA body/wrist profiles only accept body_wrist_only calibrations")
+                allowed = set(self.body_regions or ())
+                names = list(map(str,calib["marker_names"]))
+                if not names or len(set(names)) != len(names) or not set(names).issubset(allowed):
+                    raise ValueError("SOMA calibration markers must be a subset of the body's region whitelist")
+                soma_fixed = soma_finger_joints(self.model)
+                if "fitting_fixed_joints" in calib:
+                    saved = np.asarray(calib["fitting_fixed_joints"])
+                    if (saved.ndim != 1 or not np.issubdtype(saved.dtype,np.integer)
+                            or len(np.unique(saved)) != len(saved) or set(saved.tolist()) != set(soma_fixed)):
+                        raise ValueError("SOMA calibration fitting_fixed_joints do not match the active finger joints")
+                else:
+                    compatibility = copy.deepcopy(compatibility or {})
+                    compatibility["status"] = "LEGACY_PARTIAL"
+                    compatibility.setdefault("unverified_fields",[]).append("fitting_fixed_joints")
             rig = MarkerRig.from_calibration(self.model, calib)
             residual = calib["per_marker_rms"] * 1000
-            scope = str(calib["marker_scope"]) if "marker_scope" in calib else "all_markers"
             if strict and self.fit_hands and scope != "body_hands":
                 raise ValueError("The body/hand profile requires its own full body_hands calibration")
             if scope == "body_hands":
@@ -740,15 +786,7 @@ np.savez(sys.argv[6],**result)
                 finger_mask = np.isin(rig.names, fingers)
             else:
                 if strict and expected_type == "soma":
-                    joint_names = getattr(self.model, "joint_names", None)
-                    if joint_names is None or len(joint_names) != self.model.num_joints:
-                        raise ValueError("SOMA body/wrist fitting requires its named public skeleton")
-                    fingers = [j for j, name in enumerate(joint_names)
-                               if any(str(name).startswith(wrist) and str(name) != wrist
-                                      for wrist in ("LeftHand", "RightHand"))]
-                    if not fingers:
-                        raise ValueError("SOMA body/wrist fitting could not identify the finger joints")
-                    solver = RealtimeSolver(rig, SolverConfig(fixed_joints=fingers))
+                    solver = RealtimeSolver(rig, SolverConfig(fixed_joints=soma_fixed))
                 else:
                     solver = RealtimeSolver(rig)
                 finger_mask = None
@@ -775,6 +813,8 @@ np.savez(sys.argv[6],**result)
             self.detail.content += "\n\n" + self._model_description()
         if compatibility and compatibility.get("status") == "LEGACY_PARTIAL":
             self.detail.content += "\n\n**LEGACY_PARTIAL**：旧标定缺少部分模型来源字段，兼容性仅作部分核对。"
+            if "fitting_fixed_joints" in compatibility.get("unverified_fields",[]):
+                self.detail.content += "旧 SOMA 标定未记录离线手指冻结约束；本次仅保证在线固定手指，离线静态拟合与精修尚未核验，建议重新标定。"
 
     def _group_marker_rms(self):
         if self.finger_marker_mask is None or self.last_result is None or self.last_observation is None:

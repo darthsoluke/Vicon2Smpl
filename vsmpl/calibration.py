@@ -12,6 +12,7 @@ Pipeline
   D. Joint optimisation over the K frames: betas, marker offsets and per-frame poses (torch, L-BFGS).
   E. Re-assign each marker to the vertex nearest its refined rest position; repeat C-D.
 """
+from dataclasses import replace
 import json
 import numpy as np
 import torch
@@ -22,6 +23,25 @@ from .solver import RealtimeSolver, SolverConfig
 from .torch_model import TorchBody, batch_rodrigues
 
 FACING = {"+z": 0.0, "-z": np.pi, "+x": np.pi / 2, "-x": -np.pi / 2}
+
+
+def _fixed_joint_indices(fixed_joints, num_joints):
+    """Validate an explicit bind-identity pose scope without changing legacy defaults."""
+    if fixed_joints is None:
+        return np.empty(0, dtype=np.int64)
+    indices = np.asarray(fixed_joints)
+    if indices.ndim != 1:
+        raise ValueError("fixed_joints must be a one-dimensional sequence of joint indices")
+    if not len(indices):
+        return np.empty(0, dtype=np.int64)
+    if (not np.issubdtype(indices.dtype, np.integer) or indices.dtype.kind == "b"
+            or any(isinstance(value, (bool, np.bool_)) for value in fixed_joints)):
+        raise ValueError("fixed_joints must contain integer joint indices")
+    if np.any(indices <= 0) or np.any(indices >= num_joints):
+        raise ValueError("fixed_joints must exclude root 0 and stay within the model joint range")
+    if len(np.unique(indices)) != len(indices):
+        raise ValueError("fixed_joints must not contain duplicate joint indices")
+    return np.sort(indices.astype(np.int64, copy=True))
 
 
 def static_reference_pose(num_joints, static_pose="t", arm_angle_deg=45.0):
@@ -78,15 +98,23 @@ def tpose_joint_weights(J, arm_w=0.1):
 
 # ----------------------------------------------------------------------------- stage A
 def fit_tpose(model: BodyModel, obs, ok, yaw, marker_radius=0.0095, iters=400, vids=None, verbose=False,
-              reference_pose=None, regions=None):
+              reference_pose=None, regions=None, fixed_joints=None):
     """Fit root/trans/betas/body pose to a static marker set. If `vids` is given use those correspondences,
-    otherwise nearest-vertex (correspondence-free). Returns dict with params and final loss."""
+    otherwise nearest-vertex (correspondence-free). Returns dict with params and final loss.
+    Explicit ``fixed_joints`` remain at native bind identity, independent of the reference pose."""
     tb = TorchBody(model)
     J = model.num_joints
+    fixed = _fixed_joint_indices(fixed_joints, J)
     obs_t = torch.tensor(obs[ok])
     betas = torch.zeros(model.num_betas, dtype=torch.float64, requires_grad=True)
     root = torch.tensor([0.0, yaw, 0.0], dtype=torch.float64, requires_grad=True)
     body_ref = np.zeros((J - 1, 3)) if reference_pose is None else np.asarray(reference_pose)[1:]
+    body_mask = None
+    if len(fixed):
+        body_ref = body_ref.copy()
+        body_ref[fixed - 1] = 0.
+        body_mask = torch.ones((J - 1, 1), dtype=torch.float64)
+        body_mask[fixed - 1] = 0.
     body_target = torch.tensor(body_ref, dtype=torch.float64)
     body = body_target.clone().requires_grad_(True)
     v_rest0, j_rest0 = model.shaped(np.zeros(model.num_betas))
@@ -105,7 +133,8 @@ def fit_tpose(model: BodyModel, obs, ok, yaw, marker_radius=0.0095, iters=400, v
     body_w = torch.tensor(static_prior_weights(model, 0.05))[:, None]
 
     def loss_fn(stage):
-        R = batch_rodrigues(torch.cat([root[None], body], 0))[None]
+        effective_body = body if body_mask is None else body * body_mask
+        R = batch_rodrigues(torch.cat([root[None], effective_body], 0))[None]
         verts, v_rest, _ = tb.vertices(R, trans[None], betas)
         n = tb.vertex_normals(verts[0])
         surf = verts[0] + marker_radius * n
@@ -117,7 +146,7 @@ def fit_tpose(model: BodyModel, obs, ok, yaw, marker_radius=0.0095, iters=400, v
         else:
             d = (surf[vid_t] - obs_t).norm(dim=-1)
         L = _huber(d, 0.03).mean() * 1e4
-        L = L + 1e-1 * (betas ** 2).sum() + (body_w * (body - body_target) ** 2).sum()
+        L = L + 1e-1 * (betas ** 2).sum() + (body_w * (effective_body - body_target) ** 2).sum()
         return L, d
 
     for stage, (params, n_it) in enumerate([([root, trans, betas], iters // 3), ([root, trans, betas, body], iters - iters // 3)]):
@@ -131,7 +160,7 @@ def fit_tpose(model: BodyModel, obs, ok, yaw, marker_radius=0.0095, iters=400, v
     if verbose:
         print(f"    yaw {np.degrees(yaw):6.1f} deg: loss {L.item():8.3f}, marker-surface rms {d.pow(2).mean().sqrt().item() * 1000:.1f} mm")
     return {"loss": float(L.item()), "betas": betas.detach().numpy().copy(), "root": root.detach().numpy().copy(),
-            "body": body.detach().numpy().copy(), "trans": trans.detach().numpy().copy(),
+            "body": (body if body_mask is None else body * body_mask).detach().numpy().copy(), "trans": trans.detach().numpy().copy(),
             "rms": float(d.pow(2).mean().sqrt().item())}
 
 
@@ -153,8 +182,16 @@ def assign_vertices(model, fit, obs, ok, marker_radius, regions=None):
 
 
 # ----------------------------------------------------------------------------- stage C
-def track_take(rig, pos, valid, cfg=None, start=0):
-    solver = RealtimeSolver(rig, cfg or SolverConfig())
+def track_take(rig, pos, valid, cfg=None, start=0, fixed_joints=None):
+    """Track with an optional bind-identity scope, added to any fixed joints in cfg."""
+    fixed = _fixed_joint_indices(fixed_joints, rig.model.num_joints)
+    requested = cfg or SolverConfig()
+    if len(fixed):
+        existing = _fixed_joint_indices(requested.fixed_joints, rig.model.num_joints)
+        # Retain explicit caller solver settings, including any additional
+        # fixed joints, without modifying their config object.
+        requested = replace(requested, fixed_joints=np.union1d(existing, fixed).tolist())
+    solver = RealtimeSolver(rig, requested)
     T = len(pos)
     Rs = np.zeros((T, rig.model.num_joints, 3, 3))
     ts = np.zeros((T, 3))
@@ -182,10 +219,12 @@ def farthest_point_frames(Rs, cand, k, first):
 # ----------------------------------------------------------------------------- stage D
 def refine(model, vids, offsets, betas, frames_obs, frames_valid, Rs, ts, marker_radius, iters=200,
            lam_beta=1e-2, lam_off_n=3e4, lam_off_t=300.0, lam_pose=1e-2, anchor=None, lam_anchor=30.0,
-           verbose=True, anchor_pose=None):
+           verbose=True, anchor_pose=None, fixed_joints=None):
     """Anchor the static frame to T-rest, or to the fitted A-pose supplied in `anchor_pose`.
-    This constrains the ambiguity between segment orientation and marker attachment location."""
+    This constrains the ambiguity between segment orientation and marker attachment location.
+    Explicit ``fixed_joints`` override both initial and anchor poses with bind identity."""
     tb = TorchBody(model)
+    fixed = _fixed_joint_indices(fixed_joints, model.num_joints)
     vid_t = torch.as_tensor(vids)
     W = tb.weights[vid_t]
     PD = tb.posedirs_at(vid_t)
@@ -193,17 +232,27 @@ def refine(model, vids, offsets, betas, frames_obs, frames_valid, Rs, ts, marker
     val = torch.tensor(frames_valid, dtype=torch.float64)
     b = torch.tensor(betas, requires_grad=True)
     off = torch.tensor(offsets, requires_grad=True)
-    aa = torch.tensor(log_so3(Rs), requires_grad=True)  # (F,J,3)
+    initial_aa = log_so3(Rs)
+    pose_mask = None
+    if len(fixed):
+        initial_aa[:, fixed] = 0.
+        pose_mask = torch.ones((model.num_joints, 1), dtype=torch.float64)
+        pose_mask[fixed] = 0.
+    aa = torch.tensor(initial_aa, requires_grad=True)  # (F,J,3)
     tr = torch.tensor(ts, requires_grad=True)
     anchor_w = torch.tensor(static_prior_weights(model))[:, None]
-    anchor_R = None if anchor_pose is None else batch_rodrigues(torch.tensor(
-        np.asarray(anchor_pose)[1:], dtype=torch.float64))
+    anchor_body = None if anchor_pose is None else np.asarray(anchor_pose)[1:]
+    if anchor_body is not None and len(fixed):
+        anchor_body = anchor_body.copy()
+        anchor_body[fixed - 1] = 0.
+    anchor_R = None if anchor_body is None else batch_rodrigues(torch.tensor(anchor_body, dtype=torch.float64))
 
     def closure_loss():
+        effective_aa = aa if pose_mask is None else aa * pose_mask
         v_rest, J_rest = tb.shaped(b)
         n = tb.vertex_normals(v_rest)
         p_rest = v_rest[vid_t] + off
-        pred = tb.skin(batch_rodrigues(aa), tr, p_rest, W, PD, J_rest)
+        pred = tb.skin(batch_rodrigues(effective_aa), tr, p_rest, W, PD, J_rest)
         d = (pred - obs).norm(dim=-1)
         # data: mean over frames, summed over markers -> per-marker scale comparable to the offset prior
         data = (_huber(d, 0.02) * val).sum() / len(aa) * 1e4
@@ -211,13 +260,13 @@ def refine(model, vids, offsets, betas, frames_obs, frames_valid, Rs, ts, marker
         o_n = (off * nv).sum(-1)  # normal component: stays near the marker radius
         o_t = off - o_n[:, None] * nv  # tangential component: marker may slide along the skin
         reg = lam_beta * (b ** 2).sum() + lam_off_n * ((o_n - marker_radius) ** 2).sum() \
-            + lam_off_t * (o_t ** 2).sum() + lam_pose * (aa[:, 1:] ** 2).sum() / len(aa)
+            + lam_off_t * (o_t ** 2).sum() + lam_pose * (effective_aa[:, 1:] ** 2).sum() / len(aa)
         if anchor is not None:
             if anchor_R is None:
-                reg = reg + lam_anchor * (anchor_w * aa[anchor, 1:] ** 2).sum()
+                reg = reg + lam_anchor * (anchor_w * effective_aa[anchor, 1:] ** 2).sum()
             else:
                 # Keep the fitted static A-pose; do not force the anchor frame back into a T-pose.
-                relative = anchor_R.transpose(-1, -2) @ batch_rodrigues(aa[anchor, 1:])
+                relative = anchor_R.transpose(-1, -2) @ batch_rodrigues(effective_aa[anchor, 1:])
                 distance = 0.5 * ((relative - torch.eye(3, dtype=torch.float64)) ** 2).sum((-1, -2))
                 reg = reg + lam_anchor * (anchor_w[:, 0] * distance).sum()
         return data + reg, d
@@ -236,7 +285,8 @@ def refine(model, vids, offsets, betas, frames_obs, frames_valid, Rs, ts, marker
     per_marker = np.sqrt((np.where(frames_valid, d, 0) ** 2).sum(0) / np.maximum(frames_valid.sum(0), 1))
     if verbose:
         print(f"    refine: loss {L.item():.3f}, marker rms {np.sqrt((d[frames_valid] ** 2).mean()) * 1000:.1f} mm")
-    return b.detach().numpy(), off.detach().numpy(), exp_so3(aa.detach().numpy()), tr.detach().numpy(), per_marker
+    output_aa = aa if pose_mask is None else aa * pose_mask
+    return b.detach().numpy(), off.detach().numpy(), exp_so3(output_aa.detach().numpy()), tr.detach().numpy(), per_marker
 
 
 def inverse_skin_reassign(model, rig, pos, valid, Rs, ts, frames, marker_radius, inner=2, regions=None):
@@ -287,7 +337,11 @@ def reassign(model, vids, offsets, betas, marker_radius, regions=None):
 # ----------------------------------------------------------------------------- driver
 def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker_radius=0.0095,
               n_frames=40, rounds=2, min_valid_frac=0.3, refine_kw=None, verbose=True,
-              static_pose="t", arm_angle_deg=45.0, marker_regions=None):
+              static_pose="t", arm_angle_deg=45.0, marker_regions=None, fixed_joints=None):
+    fixed = _fixed_joint_indices(fixed_joints, model.num_joints)
+    fixed_kwargs = dict(fixed_joints=fixed) if len(fixed) else {}
+    if refine_kw is not None and "fixed_joints" in refine_kw:
+        raise ValueError("Set fixed_joints on calibrate, not inside refine_kw")
     names, pos, valid = rec["names"], rec["pos"], rec["valid"]
     keep = valid.mean(0) >= min_valid_frac
     if (~keep).any():
@@ -311,6 +365,9 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     # ---- A
     obs0, ok0 = tpose_average(pos, valid, *tpose)
     reference = model_static_reference(model, static_pose, arm_angle_deg)
+    if len(fixed):
+        reference = reference.copy()
+        reference[fixed] = 0.
     print(f"[calib] {static_pose.upper()}-pose window frames {tpose[0]}-{tpose[1]}: {ok0.sum()}/{M} markers usable")
     map_vids = None
     if marker_map:
@@ -321,7 +378,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     yaws = [FACING[facing]] if facing in FACING else [i * np.pi / 4 for i in range(8)]
     print(f"[calib] stage A: {static_pose.upper()}-pose fit ({len(yaws)} facing hypotheses)")
     fits = [fit_tpose(model, obs0, ok0, y, marker_radius, vids=map_vids, verbose=verbose,
-                      reference_pose=reference, regions=regions) for y in yaws]
+                      reference_pose=reference, regions=regions, **fixed_kwargs) for y in yaws]
     order = np.argsort([f["loss"] for f in fits])
     if map_vids is not None:
         if (~ok0).any():
@@ -353,7 +410,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
         for i in cands:
             vids_i, off_i, b_i, _ = init_from_fit(fits[i])
             rig_i = MarkerRig(model, names, vids_i, off_i, b_i)
-            _, _, rmse_i, _ = track_take(rig_i, pos[:end_f], valid[:end_f], start=tpose[0])
+            _, _, rmse_i, _ = track_take(rig_i, pos[:end_f], valid[:end_f], start=tpose[0], **fixed_kwargs)
             fin = rmse_i[np.isfinite(rmse_i)]
             scores.append(np.median(fin) if len(fin) else np.inf)
             if verbose:
@@ -381,7 +438,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
         model.prepare_for(betas)  # SOMA: re-linearise the identity model at the current shape (no-op for SMPL)
         rig = MarkerRig(model, names, vids, offsets, betas)
         print(f"[calib] round {rd + 1}/{rounds}: tracking {len(pos)} frames ...")
-        Rs, ts, rmse, clean = track_take(rig, pos, valid, start=0)
+        Rs, ts, rmse, clean = track_take(rig, pos, valid, start=0, **fixed_kwargs)
         good = np.nonzero((rmse < 0.03) & clean & (valid.mean(1) >= 0.8))[0]
         if len(good) < 5:
             raise RuntimeError("tracking failed on most frames; check facing / marker labels")
@@ -397,7 +454,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
             print(f"    anchor frame: {sel[0] if anchor is not None else None}")
         betas, offsets, refined_Rs, refined_ts, per_marker = refine(model, vids, offsets, betas, pos[sel], valid[sel], Rs[sel], ts[sel],
                                                   marker_radius, anchor=anchor, verbose=verbose, anchor_pose=anchor_pose,
-                                                  **(refine_kw or {}))
+                                                  **(refine_kw or {}), **fixed_kwargs)
         if map_vids is None:
             vids, offsets = reassign(model, vids, offsets, betas, marker_radius, regions=regions)
 
@@ -428,4 +485,5 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     return {"marker_names": np.array(names), "vertex_ids": vids, "offsets": offsets, "betas": betas,
             "marker_radius": marker_radius, "per_marker_rms": per_marker, "static_pose": static_pose,
             "static_reference_pose": reference, "initial_static_fit_pose": np.concatenate([fit["root"][None], fit["body"]]),
-            **model.calibration_metadata(), **final_diagnostics}
+            **model.calibration_metadata(), **final_diagnostics,
+            **(dict(fixed_joints=fixed.copy(), fixed_pose_scope="native_bind_identity") if len(fixed) else {})}

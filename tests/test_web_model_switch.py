@@ -292,6 +292,29 @@ class WebModelSwitchTests(unittest.TestCase):
         self.assertNotIn(20,self.app.solver.cfg.fixed_joints)
         self.assertNotIn(21,self.app.solver.cfg.fixed_joints)
 
+    def test_soma_rejects_non_body_scope_and_markers_outside_whitelist_but_allows_subset(self):
+        self.switch("soma")
+        for scope in ("all_markers","body_hands","unknown"):
+            with self.subTest(scope=scope), self.assertRaisesRegex(ValueError,"body_wrist_only"):
+                self.app._load_calibration(self.checkpoint("soma",marker_scope=scope))
+        with self.assertRaisesRegex(ValueError,"whitelist"):
+            self.app._load_calibration(self.checkpoint("soma",marker_names=np.array(BODY+[FINGERS[0]])))
+        subset = self.checkpoint("soma",marker_names=np.array(BODY[:3]),vertex_ids=np.zeros(3,int),
+            offsets=np.zeros((3,3)),per_marker_rms=np.zeros(3),fitting_fixed_joints=np.array([25,26,40,41]))
+        self.app._load_calibration(subset)
+        self.assertEqual(self.app.rig.names,BODY[:3])
+
+    def test_soma_rejects_changed_offline_finger_constraints_and_flags_missing_legacy_proof(self):
+        self.switch("soma")
+        for fixed in (np.array([25,40]),np.array([25,26,40,41,41]),np.array([25.,26.,40.,41.])):
+            with self.subTest(fixed=fixed), self.assertRaisesRegex(ValueError,"fitting_fixed_joints"):
+                self.app._load_calibration(self.checkpoint("soma",fitting_fixed_joints=fixed))
+        with patch("vsmpl.soma_model.check_calibration_model",return_value=dict(status="PASS",unverified_fields=[])):
+            self.app._load_calibration(self.checkpoint("soma"))
+        self.assertEqual(self.app.calibration_compatibility["status"],"LEGACY_PARTIAL")
+        self.assertIn("离线静态拟合与精修尚未核验",self.app.detail.content)
+        self.assertEqual(self.app.solver.cfg.fixed_joints,[25,26,40,41])
+
     def test_new_subject_invalidates_every_profile_cache_without_deleting_files(self):
         smpl = self.checkpoint(); self.activate_checkpoint(smpl)
         self.switch("soma")
@@ -347,6 +370,7 @@ class WebModelSwitchTests(unittest.TestCase):
         def fit(model,rec,**kwargs):
             self.assertEqual(model.model_type,"soma")
             self.assertEqual(model.num_betas,2)
+            self.assertEqual(kwargs["fixed_joints"],[25,26,40,41])
             return dict(marker_names=np.array(rec["names"]),vertex_ids=np.zeros(52,int),
                 offsets=np.zeros((52,3)),betas=np.array([.5,.2]),per_marker_rms=np.zeros(52),static_pose="a")
         with patch("subprocess.run",side_effect=inline), patch("vsmpl.calibration.calibrate",side_effect=fit):
@@ -357,8 +381,11 @@ class WebModelSwitchTests(unittest.TestCase):
         with np.load(directory/"subject_calib.npz",allow_pickle=False) as result:
             self.assertEqual(str(result["model_type"]),"soma")
             self.assertEqual(str(result["profile_signature"]),frozen["profile_signature"])
+            self.assertEqual(result["fitting_fixed_joints"].tolist(),[25,26,40,41])
+            self.assertEqual(str(result["fitting_scope"]),"body_wrist_only")
         request = json.loads((directory/"calibration_request.json").read_text())
         self.assertEqual(request["num_betas"],2)
+        self.assertEqual(request["fixed_joints"],frozen["fixed_joints"])
         self.assertEqual(request["marker_regions_snapshot_sha256"],hashlib.sha256((directory/"marker_regions.json").read_bytes()).hexdigest())
 
     def test_changed_assets_prevent_sampling_without_creating_a_new_run(self):
@@ -398,6 +425,18 @@ class WebModelSwitchTests(unittest.TestCase):
         self.assertIsNone(legacy.model_selector)
         self.assertIsNone(legacy.preview_mesh)
         self.assertFalse(legacy.profiles_enabled)
+
+    def test_legacy_checkpoint_gender_is_checked_without_changing_missing_field_compatibility(self):
+        self.app.profiles_enabled = False
+        with self.assertRaisesRegex(ValueError,"gender"):
+            self.app._load_calibration(self.checkpoint(signature=False,gender="female"))
+        self.app._load_calibration(self.checkpoint(signature=False))
+        self.assertIn("本人正头",self.app.detail.content)
+
+    def test_smplx_sampling_does_not_add_soma_finger_constraints(self):
+        self.sample()
+        self.assertNotIn("fixed_joints",self.app.sample_model_request)
+        self.assertNotIn("fitting_scope",self.app.sample_model_request)
 
     def test_smplx_tracking_keeps_original_output_fields_and_template_lifecycle(self):
         path = self.checkpoint(signature=False)
