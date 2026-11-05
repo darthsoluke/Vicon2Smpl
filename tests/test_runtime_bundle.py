@@ -67,6 +67,56 @@ class RuntimeBundleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 verify_bundle.verify(moved)
 
+    def test_optional_soma_bundle_profiles_and_assets_remain_valid_after_move(self):
+        """Check packaging/layout, not numerical models or installation of toy wheels."""
+        with TemporaryDirectory() as directory:
+            args = self.fixture(directory)
+            root = Path(directory)
+            (root / "regions.json").write_text('{"C7":[1,2]}')
+            assets = root / "soma-assets"
+            assets.mkdir()
+            for name in ("SOMA_neutral.npz", "SOMA_template_rig.usda", "SOMA_procedural_transforms.json", "SOMAHand.npz"):
+                (assets / name).write_bytes(("toy SOMA packaging fixture: " + name).encode())
+            regions = root / "soma-regions.json"
+            regions.write_text('{"C7":[3,4]}')
+            conversion = regions.with_suffix(".conversion.json")
+            conversion.write_text(json.dumps(dict(source_sha256=hashlib.sha256((root / "regions.json").read_bytes()).hexdigest(), soma_lod="mid")))
+            args.soma_assets, args.soma_body_regions = str(assets), str(regions)
+            manifest = package_runtime.build(args)
+            self.assertTrue(manifest["complete"])
+            self.assertFalse(manifest["clean_install_verified"])
+            bundle = Path(args.output)
+            moved = bundle.with_name("relocated-dual-model-bundle")
+            bundle.rename(moved)
+            self.assertEqual(verify_bundle.verify(moved)["status"], "PASS")
+            config_path = moved / "config/site.json"
+            config = json.loads(config_path.read_text())
+            self.assertEqual(config["model_profiles"], "model_profiles.json")
+            self.assertTrue((config_path.parent / config["warp_cache"]).is_dir())
+            self.assertTrue((config_path.parent / config["data_output"]).is_dir())
+            spec = importlib.util.spec_from_file_location("bundle_profile_parser", ROOT / "vsmpl/model_profiles.py")
+            profiles_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(profiles_module)
+            default, profiles = profiles_module.load_profiles(config_path.parent / config["model_profiles"], None)
+            self.assertEqual(default, "smplx_full")
+            self.assertTrue(profiles[default]["fit_hands"])
+            soma = profiles["soma_body"]
+            self.assertEqual(soma["model_type"], "soma")
+            self.assertEqual(soma["model_path"], str((moved / "assets/soma").resolve()))
+            self.assertEqual(soma["soma_lod"], "mid")
+            self.assertEqual(soma["soma_identity"], "soma")
+            self.assertFalse(soma["fit_hands"])
+            self.assertEqual(len(soma["model_files_sha256"]), 3)
+            self.assertEqual(soma["body_regions_sha256"], hashlib.sha256(regions.read_bytes()).hexdigest())
+            self.assertEqual((moved / "assets/body_marker_regions_soma.conversion.json").read_bytes(), conversion.read_bytes())
+            for name in ("SOMA_neutral.npz", "SOMA_template_rig.usda", "SOMA_procedural_transforms.json", "SOMAHand.npz"):
+                relative = "assets/soma/" + name
+                self.assertEqual(manifest["files"][relative], hashlib.sha256((assets / name).read_bytes()).hexdigest())
+            restore = (moved / "restore.sh").read_text()
+            self.assertIn('"$BUNDLE_ROOT/environment"', restore)
+            self.assertIn('"$BUNDLE_ROOT/python/bin/python3"', restore)
+            self.assertIn('"$BUNDLE_ROOT/venv"', restore)
+
     def test_missing_wheel_integrity_fails_before_creating_bundle(self):
         with TemporaryDirectory() as directory:
             args = self.fixture(directory)

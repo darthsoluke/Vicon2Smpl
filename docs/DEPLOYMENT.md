@@ -1,6 +1,10 @@
 # Linux 共享部署与离线依赖包
 
-本页对应 `run_web.py` 的原生 SMPL-X 身体、手腕和手指拟合。网页读取 Vicon DataStream，
+本页对应 `run_web.py` 的双模型网页：SMPL-X 身体、手腕和手指，以及 SOMA 身体与手腕。
+SOMA 固定使用 `py-soma-x==0.3.5` 的 legacy77 公共参数路径（78 关节 LBS rig 去掉虚拟 Root），
+仅用纯 LBS，关闭 procedural transforms 和 pose correctives。原生 SOMA 手指拟合尚未接入，
+身体/手腕模式在离线标定与在线求解中均固定手指，不使用 SMPL-X 的手指 PCA 先验。
+网页读取 Vicon DataStream，
 不会调用 Shogun 开拍/停拍，也不修改正式录制。旧的 `aitviewer`、Python Vicon SDK 入口为可选路径，
 不属于本页验证的 Linux 网页依赖闭包。
 
@@ -28,6 +32,11 @@
 如先用 `--metadata-only` 检查环境，继续同一个未完成目录时加 `--resume`；已完整的包不覆盖。
 如果 Torch 使用 `+cpu` 等本地版本，提供对应官方索引；导出失败或仅有元数据的目录不能当成完整离线包。
 命令和报告不要包含带密码的索引地址。`environment.json` 和 `manifest.json` 保存版本及完成状态。
+
+双模型 Linux / CPython 3.11 CPU 环境的参考锁为
+[`requirements-linux-soma-py311.lock`](../requirements-linux-soma-py311.lock)，共 52 项，包含
+`py-soma-x==0.3.5`、Warp、USD 和 cholespy 等 SOMA 依赖。旧 SMPL-X wheelhouse 不能仅添加资产就当成双模型包；
+须从完整环境重新导出并验证离线安装。该锁不适用于其他操作系统或 Python ABI。
 
 Python 需要完整、可搬移的独立安装，不要只复制一个链接到系统解释器的 venv。
 可以使用已核对来源的 python-build-standalone/uv 管理的 Linux Python；记录来源和哈希，
@@ -96,6 +105,13 @@ python3 scripts/package_runtime.py \
 把配置中的 IP、输出目录和依赖路径改成已检查的现场值。路径可以相对配置文件。
 服务默认只加载通用模型；新被试通过页面重新标定。只有同一被试、同一套贴点，才在本地配置添加
 `calib` 和 `subject`，两项必须一起填写，校验不能绕过。
+
+双模型配置通过 `model_profiles` 引用本地 profiles JSON，格式见
+[`config/model_profiles.example.json`](../config/model_profiles.example.json)。网页“人体模型”下拉框仅在预览或
+已停止并保存的空闲阶段可切换；采样、标定计算、实时拟合和模型加载期间禁用。
+两模型各自标定，体型系数和 marker 顶点绑定不能混用；同一被试切回时只重载该模型自己的已保存标定，
+换被试或重新贴点后应重新标定。静态 A-pose 画面是模型预览，**不是真人实时人像**；
+完成当前模型标定并点击“开始实时拟合”后才进入实时结果。
 
 `output` 放热状态、锁和日志，`data_output` 放新采样和标定结果；省略后者时保持旧行为。
 共享存储上小文件操作较慢时，热状态与 Numba 缓存应留在本地快目录，数据输出再指向共享存储。
