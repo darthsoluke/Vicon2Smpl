@@ -9,6 +9,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import ipaddress
 import json
 import os
@@ -18,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 
 
 LOCK_NAME = ".vicon2smpl-service.lock"
@@ -52,19 +54,40 @@ def _atomic_json(path, data):
             temp.unlink()
 
 
+def _profile_api(cfg):
+    """Load only the standard-library profile parser from this code checkout."""
+    module_path = Path(cfg["code_root"]) / "vsmpl" / "model_profiles.py"
+    spec = importlib.util.spec_from_file_location("_service_model_profiles", module_path)
+    if spec is None or spec.loader is None:
+        raise ServiceError("Cannot load model profile parser")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_profiles(cfg, validate):
+    module = _profile_api(cfg)
+    default, profiles = module.load_profiles(cfg["model_profiles"], argparse.Namespace(**cfg), validate_paths=validate)
+    return module, default, profiles
+
+
 def load_config(path):
     path = Path(path).expanduser().resolve(strict=True)
     raw = _read_json(path)
     required = {"python", "code_root", "output", "source", "native_reader", "model_path", "bind", "port"}
     allowed = required | {"model_type", "body_regions", "fit_hands", "hand_prior",
-                          "hand_components", "calib", "subject", "library_path", "numba_cache", "data_output"}
+                          "hand_components", "calib", "subject", "library_path", "numba_cache", "data_output",
+                          "gender", "num_betas", "soma_lod", "soma_identity", "model_profiles", "warp_cache"}
     if not isinstance(raw, dict) or required - raw.keys() or raw.keys() - allowed:
         missing = sorted(required - raw.keys()) if isinstance(raw, dict) else sorted(required)
         extra = sorted(raw.keys() - allowed) if isinstance(raw, dict) else []
         raise ServiceError(f"Invalid config: missing={missing}, unknown={extra}")
     cfg = dict(raw)
+    if isinstance(raw.get("model_path"), str) and (raw["model_path"].strip().lower() in {"hf", "auto"}
+                                                  or urlsplit(raw["model_path"]).scheme):
+        raise ServiceError("Service model_path must use local assets, not hf/auto/URLs")
     for name in ("python", "code_root", "output", "native_reader", "model_path",
-                 "body_regions", "hand_prior", "calib", "numba_cache", "data_output"):
+                 "body_regions", "hand_prior", "calib", "numba_cache", "data_output", "model_profiles", "warp_cache"):
         if name in cfg:
             if not isinstance(cfg[name], str) or not cfg[name]:
                 raise ServiceError(f"{name} must be a nonempty path string")
@@ -88,8 +111,28 @@ def load_config(path):
     cfg.setdefault("model_type", "smplx")
     cfg.setdefault("fit_hands", False)
     cfg.setdefault("hand_components", 20)
-    if cfg["model_type"] not in {"smpl", "smplh", "smplx"}:
+    cfg.setdefault("gender", "neutral")
+    cfg.setdefault("num_betas", 10)
+    cfg.setdefault("soma_lod", "mid")
+    cfg.setdefault("soma_identity", "soma")
+    if "model_profiles" in cfg:
+        module, default, profiles = _load_profiles(cfg, False)
+        for key in module.ARG_FIELDS:
+            if profiles[default][key] is None:
+                cfg.pop(key, None)
+            else:
+                cfg[key] = profiles[default][key]
+        cfg["model_profile_default"] = default
+        cfg["model_profile_signatures"] = {key: module.profile_signature(profile) for key, profile in profiles.items()}
+        cfg["model_profiles_sha256"] = hashlib.sha256(Path(cfg["model_profiles"]).read_bytes()).hexdigest()
+    if cfg["model_type"] not in {"smpl", "smplh", "smplx", "soma"}:
         raise ServiceError("Invalid model_type")
+    if cfg["gender"] not in {"neutral", "male", "female"}:
+        raise ServiceError("Invalid gender")
+    if type(cfg["num_betas"]) is not int or cfg["num_betas"] < 1:
+        raise ServiceError("num_betas must be a positive integer")
+    if cfg["soma_lod"] not in {"mid", "low", "xlo"} or cfg["soma_identity"] not in {"soma", "smpl", "smplx"}:
+        raise ServiceError("Invalid SOMA LOD or identity model")
     if type(cfg["fit_hands"]) is not bool:
         raise ServiceError("fit_hands must be a JSON boolean")
     if type(cfg["hand_components"]) is not int or not 1 <= cfg["hand_components"] <= 45:
@@ -130,7 +173,7 @@ def validate_paths(cfg):
     if "data_output" in cfg:
         _require_path(cfg["data_output"], "dir", writable=True)
     model = Path(cfg["model_path"])
-    _require_path(model, "dir" if model.is_dir() else "file")
+    _require_path(model, "dir" if cfg["model_type"] == "soma" or model.is_dir() else "file")
     for key in ("body_regions", "hand_prior", "calib"):
         if key in cfg:
             _require_path(cfg[key])
@@ -138,11 +181,24 @@ def validate_paths(cfg):
         _require_path(directory, "dir")
     if "numba_cache" in cfg:
         _require_path(cfg["numba_cache"], "dir", writable=True)
+    if "warp_cache" in cfg:
+        _require_path(cfg["warp_cache"], "dir", writable=True)
+    if "model_profiles" in cfg:
+        _require_path(cfg["model_profiles"])
+        module, default, profiles = _load_profiles(cfg, True)
+        signatures = {key: module.profile_signature(profile) for key, profile in profiles.items()}
+        if (default != cfg["model_profile_default"] or signatures != cfg["model_profile_signatures"]
+                or hashlib.sha256(Path(cfg["model_profiles"]).read_bytes()).hexdigest() != cfg["model_profiles_sha256"]):
+            raise ServiceError("Model profile configuration changed after it was loaded")
+        return dict(default=default, profiles=[dict(id=key, label=profile["label"], model_type=profile["model_type"],
+                    soma_lod=profile["soma_lod"], fingerprint=signatures[key]) for key, profile in profiles.items()])
+    return None
 
 
 def child_argv(cfg):
     args = [cfg["python"], "-u", str(Path(cfg["code_root"]) / "run_web.py")]
-    for key in ("source", "native_reader", "model_path", "model_type", "bind", "port", "output", "data_output", "body_regions"):
+    for key in ("source", "native_reader", "model_path", "model_type", "gender", "num_betas", "soma_lod", "soma_identity",
+                "model_profiles", "bind", "port", "output", "data_output", "body_regions"):
         if key in cfg:
             args.extend(["--" + key.replace("_", "-"), str(cfg[key])])
     if cfg["fit_hands"]:
@@ -160,6 +216,8 @@ def child_environment(cfg):
         env["LD_LIBRARY_PATH"] = os.pathsep.join(cfg["library_path"] + ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     if "numba_cache" in cfg:
         env["NUMBA_CACHE_DIR"] = cfg["numba_cache"]
+    if "warp_cache" in cfg:
+        env["WARP_CACHE_PATH"] = cfg["warp_cache"]
     return env
 
 
@@ -250,13 +308,13 @@ def service_status(cfg):
 
 
 def preflight(cfg):
-    validate_paths(cfg)
+    profiles = validate_paths(cfg)
     check_port(cfg)
     env = child_environment(cfg)
-    keys = list(THREAD_ENV) + ["LD_LIBRARY_PATH", "NUMBA_CACHE_DIR"]
+    keys = list(THREAD_ENV) + ["LD_LIBRARY_PATH", "NUMBA_CACHE_DIR", "WARP_CACHE_PATH"]
     return dict(state="preflight_pass", argv=child_argv(cfg), cwd=cfg["code_root"],
                 environment={key: env[key] for key in keys if key in env},
-                hardware_connected=False)
+                hardware_connected=False, model_profiles=profiles)
 
 
 def start(cfg):

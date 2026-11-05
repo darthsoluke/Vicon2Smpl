@@ -11,6 +11,8 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
 
 
 SERVICE = Path(__file__).resolve().parents[1] / "scripts" / "service.py"
@@ -111,6 +113,122 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(result["environment"]["LD_LIBRARY_PATH"].startswith(str(self.root / "library")))
         self.assertFalse((self.root / "output" / "starts").exists())
         self.assertFalse((self.root / "output" / service.PID_NAME).exists())
+
+    def write_profiles(self, profiles, default="soma"):
+        package = self.root / "vsmpl"
+        package.mkdir(exist_ok=True)
+        (package / "__init__.py").write_text("")
+        shutil.copyfile(SERVICE.parents[1] / "vsmpl/model_profiles.py", package / "model_profiles.py")
+        (self.root / "models.json").write_text(json.dumps(dict(default=default, profiles=profiles)))
+        self.cfg["model_profiles"] = "models.json"
+        self.write_config()
+
+    def test_soma_local_assets_arguments_and_independent_warp_cache(self):
+        (self.root / "soma-assets").mkdir()
+        self.cfg.update(model_type="soma", model_path="soma-assets", num_betas=12,
+                        soma_lod="low", soma_identity="soma", warp_cache="warp-cache")
+        self.write_config()
+        self.assertIn("Expected dir", self.cli("preflight", success=False)["error"])
+        (self.root / "warp-cache").mkdir()
+        result = self.cli("preflight", "--dry-run")
+        argv = result["argv"]
+        for option, value in (("--model-type", "soma"), ("--num-betas", "12"),
+                              ("--soma-lod", "low"), ("--soma-identity", "soma")):
+            self.assertEqual(argv[argv.index(option) + 1], value)
+        self.assertEqual(result["environment"]["WARP_CACHE_PATH"], str(self.root / "warp-cache"))
+        self.assertEqual(result["environment"]["CUDA_VISIBLE_DEVICES"], "")
+        self.assertFalse((self.root / "output/starts").exists())
+
+    def test_soma_rejects_full_hands_and_service_online_assets(self):
+        (self.root / "soma-assets").mkdir()
+        self.cfg.update(model_type="soma", model_path="soma-assets", fit_hands=True)
+        self.write_config()
+        self.assertIn("fit_hands requires smplx", self.cli("preflight", success=False)["error"])
+        self.cfg["fit_hands"] = False
+        for value in ("hf", "auto", "https://example.invalid/assets"):
+            self.cfg["model_path"] = value
+            self.write_config()
+            with self.subTest(value=value):
+                self.assertIn("local assets", self.cli("preflight", success=False)["error"])
+
+    def test_profile_default_binds_actual_child_arguments_without_numpy(self):
+        (self.root / "soma-assets").mkdir()
+        profiles = [dict(id="smplx", label="SMPL-X", model_type="smplx", model_path="model.npz"),
+                    dict(id="soma", label="SOMA", model_type="soma", model_path="soma-assets", soma_lod="low", num_betas=12)]
+        self.write_profiles(profiles)
+        before = set(sys.modules)
+        loaded = service.load_config(self.config)
+        self.assertNotIn("numpy", set(sys.modules) - before)
+        self.assertEqual(loaded["model_type"], "soma")
+        self.assertEqual(loaded["model_path"], str(self.root / "soma-assets"))
+        result = self.cli("preflight", "--dry-run")
+        argv = result["argv"]
+        self.assertEqual(argv[argv.index("--model-type") + 1], "soma")
+        self.assertEqual(argv[argv.index("--model-profiles") + 1], str(self.root / "models.json"))
+        self.assertEqual(result["model_profiles"]["default"], "soma")
+        self.assertEqual(len(result["model_profiles"]["profiles"]), 2)
+        self.assertTrue(all(len(item["fingerprint"]) == 64 for item in result["model_profiles"]["profiles"]))
+        self.assertFalse((self.root / "output/starts").exists())
+
+    def test_every_profile_path_is_checked_before_starting_default(self):
+        (self.root / "soma-assets").mkdir()
+        (self.root / "regions.json").write_text('{"C7":[1]}')
+        self.write_profiles([
+            dict(id="soma", label="SOMA", model_type="soma", model_path="soma-assets"),
+            dict(id="smplx", label="SMPL-X hands", model_type="smplx", model_path="model.npz",
+                 fit_hands=True, body_regions="regions.json", hand_prior="not-downloaded.npz")])
+        result = self.cli("start", success=False)
+        self.assertIn("hand_prior", result["error"])
+        self.assertFalse((self.root / "output/starts").exists())
+
+    def test_changed_profile_snapshot_fails_before_launch(self):
+        self.write_profiles([dict(id="smplx", label="SMPL-X", model_type="smplx", model_path="model.npz")], default="smplx")
+        loaded = service.load_config(self.config)
+        content = json.loads((self.root / "models.json").read_text())
+        content["profiles"][0]["label"] = "changed after load"
+        (self.root / "models.json").write_text(json.dumps(content))
+        with patch.object(service, "__file__", str(self.root / "scripts/service.py")):
+            with self.assertRaisesRegex(service.ServiceError, "changed after"):
+                service.validate_paths(loaded)
+
+    def test_healthcheck_validates_all_profile_model_arguments_without_hardware(self):
+        health_spec = importlib.util.spec_from_file_location("profile_healthcheck", SERVICE.parent / "healthcheck.py")
+        health = importlib.util.module_from_spec(health_spec)
+        health_spec.loader.exec_module(health)
+        (self.root / "soma-assets").mkdir()
+        self.write_profiles([
+            dict(id="soma", label="SOMA", model_type="soma", model_path="soma-assets", soma_lod="low", num_betas=12),
+            dict(id="smplx", label="SMPL-X", model_type="smplx", model_path="model.npz")])
+        calls = []
+        def load(*args, **kwargs):
+            calls.append((args, kwargs))
+            soma = args[1] == "soma"
+            return SimpleNamespace(num_joints=77 if soma else 55,
+                                   v_template=range(4505 if soma else 10475), num_betas=kwargs["num_betas"])
+        fake = {}
+        for name, attributes in {
+            "numpy": dict(empty=lambda *a, **kw: None),
+            "vsmpl.body_model": dict(BodyModel=SimpleNamespace(load=load)),
+            "vsmpl.calibration_input": dict(prepare_calibration_input=lambda rec, regions, count: (rec, regions)),
+            "vsmpl.hand_pca": dict(HandPCA=SimpleNamespace()),
+        }.items():
+            module = ModuleType(name)
+            module.__dict__.update(attributes)
+            fake[name] = module
+        with patch.dict(sys.modules, fake):
+            with patch.object(health.importlib, "import_module", return_value=SimpleNamespace(__version__="fixture")):
+                with patch.object(health.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="fixture", stderr="")):
+                    with patch.object(health.platform, "system", return_value="Linux"):
+                        with patch.object(health.platform, "platform", return_value="fixture Linux"):
+                            report = health.check(self.config)
+        self.assertEqual(report["status"], "PASS", report)
+        self.assertFalse(report["hardware_connection_opened"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], dict(num_betas=12, soma_lod="low", soma_identity="soma"))
+        self.assertEqual(calls[1][1], dict(num_betas=10))
+        default = next(item for item in report["checks"] if item["name"] == "licensed_model_and_marker_regions")
+        self.assertEqual(default["detail"]["joints"], 77)
+        self.assertEqual(default["detail"]["lod"], "low")
 
     def test_venv_python_symlink_is_preserved_in_child_and_manager_launches(self):
         venv_root = self.root / "venv"

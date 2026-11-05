@@ -55,6 +55,22 @@ python scripts/convert_regions_to_soma.py --regions body_regions_smplx.json --ou
 工具利用 SOMA 资产里贴合在 SMPL-X 模板上的 SOMA 网格（`SMPLX/SOMA_wrap.obj`），让每个 SOMA 顶点继承最近 SMPL-X 顶点的标签，
 并写一份 `*.conversion.json` 记录来源文件的 SHA256 和每个标签的顶点数。转换后的区域仍需对照现场贴点核对一次。
 
+## Viser 模型切换
+
+复制 `config/model_profiles.example.json`，填写已经下载并冻结的模型、区域和先验路径，再向网页或服务配置传入
+`--model-profiles <配置.json>`。配置文件只接受本地资产，不在切换时自动从 HuggingFace 下载。
+
+- “SMPL-X 身体＋双手”使用原有72点和每手20维PCA先验。
+- “SOMA 身体＋手腕（LBS）”使用转换并核对过的身体白名单；手指保持绑定姿态，不作为测量结果。
+- 空闲时可切换。采样、计算或实时拟合中，先停止并保存，再切换模型。
+- 两个模型的身份系数、顶点绑定和标定不互相套用；同一被试切回时可重载此前保存的对应模型标定。
+  切换被试后需重新确认标定；重新贴点仍应重标。
+- 未标定时显示的是明确标注的静态A-pose模板预览，不能当作真人实时拟合。
+
+采样起点冻结完整模型配置、资产、区域、手先验及其SHA，worker只读取该快照；改动输入文件后须重新采样。
+SOMA检查点另记录包版本、关节顺序、静态rig指纹和纯LBS配置。指纹不代表外部资产文件已独立验收，
+旧检查点缺少新字段时显示部分校验，已有字段不匹配则拒绝加载。
+
 ## 输出
 
 - `--save` / 网页保存的 npz：`poses (T, 77·3)`、`trans`（Hips 位置）、`identity_coeffs (128,)`、`identity_model_type`、

@@ -1,0 +1,27 @@
+{
+  "default": "smplx_full",
+  "profiles": [
+    {
+      "id": "smplx_full",
+      "label": "SMPL-X 身体＋双手",
+      "model_type": "smplx",
+      "model_path": "/absolute/path/to/licensed/smplx/model.npz",
+      "body_regions": "/absolute/path/to/smplx_body_regions.json",
+      "fit_hands": true,
+      "hand_prior": "/absolute/path/to/licensed/pose_hand_prior.npz",
+      "hand_components": 20,
+      "num_betas": 10
+    },
+    {
+      "id": "soma_body",
+      "label": "SOMA 身体＋手腕（LBS）",
+      "model_type": "soma",
+      "model_path": "/absolute/path/to/frozen/soma/assets",
+      "body_regions": "/absolute/path/to/soma_mid_body_regions.json",
+      "soma_lod": "mid",
+      "soma_identity": "soma",
+      "fit_hands": false,
+      "num_betas": 10
+    }
+  ]
+}

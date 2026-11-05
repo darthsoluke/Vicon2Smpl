@@ -4,6 +4,7 @@
 当前现场网页支持原生 **SMPL-X 身体＋双手 72 点**，包含头颈、手腕和手指；也保留 SMPL / SMPL-H 身体路径。
 也可以用 NVIDIA **SOMA** 人体模型（`--model-type soma`，身体＋手腕），直接输出 SOMA 的 77 关节姿态与身份系数，
 原理、用法和限制见 [SOMA 后端](docs/SOMA.md)。
+网页传入 `--model-profiles <本地配置.json>` 后，可在“人体模型”中切换 SMPL-X 与 SOMA；两者分别标定。
 
 实验室共享部署、精确依赖离线包、单实例启动和健康检查见 [部署说明](docs/DEPLOYMENT.md)。
 4090D 的目录、网页、SSH 与用户服务入口见 [4090D 使用说明](docs/4090D.md)。

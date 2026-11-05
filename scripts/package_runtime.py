@@ -59,6 +59,23 @@ def build(args):
     inputs = {"model.npz": Path(args.model).resolve(strict=True),
               "pose_hand_prior.npz": Path(args.hand_prior).resolve(strict=True),
               "body_marker_regions.json": Path(args.body_regions).resolve(strict=True)}
+    soma_assets = getattr(args, "soma_assets", None)
+    soma_regions = getattr(args, "soma_body_regions", None)
+    if bool(soma_assets) != bool(soma_regions):
+        raise ValueError("soma-assets and soma-body-regions must be provided together")
+    if soma_assets:
+        soma_assets = Path(soma_assets).resolve(strict=True)
+        if not soma_assets.is_dir() or output.is_relative_to(soma_assets):
+            raise ValueError("SOMA assets must be a separate local directory")
+        for name in ("SOMA_neutral.npz", "SOMA_template_rig.usda", "SOMA_procedural_transforms.json"):
+            candidate = soma_assets / name
+            if not candidate.is_file():
+                raise ValueError("Missing full local SOMA asset: " + name)
+            with candidate.open("rb") as asset_file:
+                pointer = asset_file.read(80).startswith(b"version https://git-lfs")
+            if pointer:
+                raise ValueError("Missing full local SOMA asset: " + name)
+        inputs["body_marker_regions_soma.json"] = Path(soma_regions).resolve(strict=True)
     native = Path(args.native_reader).resolve(strict=True)
     if not native.is_file() or not os.access(native, os.X_OK):
         raise ValueError("native-reader must be executable")
@@ -87,6 +104,11 @@ def build(args):
         (output / "assets").mkdir()
         for name, path in inputs.items():
             shutil.copy2(path, output / "assets" / name)
+        if soma_assets:
+            shutil.copytree(soma_assets, output / "assets/soma")
+            conversion = Path(soma_regions).with_suffix(".conversion.json")
+            if conversion.is_file():
+                shutil.copy2(conversion, output / "assets/body_marker_regions_soma.conversion.json")
         for directory in ("runtime", "data", "numba_cache", "config"):
             (output / directory).mkdir(mode=0o700 if directory == "runtime" else 0o755)
         config = dict(python="../venv/bin/python", code_root="../code", output="../runtime", data_output="../data",
@@ -95,6 +117,17 @@ def build(args):
                       port=args.port, body_regions="../assets/body_marker_regions.json",
                       fit_hands=True, hand_prior="../assets/pose_hand_prior.npz",
                       hand_components=20, library_path=library_dirs, numba_cache="../numba_cache")
+        if soma_assets:
+            (output / "warp_cache").mkdir()
+            config.update(model_profiles="model_profiles.json", warp_cache="../warp_cache")
+            profiles = dict(default="smplx_full", profiles=[
+                dict(id="smplx_full", label="SMPL-X 身体＋双手", model_type="smplx",
+                     model_path="../assets/model.npz", body_regions="../assets/body_marker_regions.json",
+                     fit_hands=True, hand_prior="../assets/pose_hand_prior.npz", hand_components=20),
+                dict(id="soma_body", label="SOMA 身体＋手腕（LBS）", model_type="soma",
+                     model_path="../assets/soma", body_regions="../assets/body_marker_regions_soma.json",
+                     soma_lod="mid", soma_identity="soma", fit_hands=False)])
+            (output / "config/model_profiles.json").write_text(json.dumps(profiles, ensure_ascii=False, indent=2) + "\n")
         (output / "config/site.json").write_text(json.dumps(config, indent=2) + "\n")
         restore = '''#!/bin/sh
 set -eu
@@ -129,6 +162,8 @@ def main():
     for name in ("source", "environment", "python-home", "sdk-root", "native-reader", "model", "hand-prior", "body-regions", "output"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--sdk-library-dir", action="append", required=True)
+    parser.add_argument("--soma-assets", help="Optional frozen local NVIDIA SOMA assets; pair with --soma-body-regions")
+    parser.add_argument("--soma-body-regions", help="Reviewed SOMA-mid body/wrist region JSON for model switching")
     parser.add_argument("--vicon-source", required=True)
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8792)

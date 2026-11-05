@@ -51,6 +51,9 @@ python3 scripts/package_runtime.py \
   --output <新的内部包目录>
 ```
 
+双模型发布另传 `--soma-assets <已冻结的本地SOMA资产目录> --soma-body-regions <已核对的SOMA-mid身体区域.json>`。
+包内会生成两模型配置和独立 Warp 缓存目录；SOMA必须已经安装于导出的环境，且包内含本地核心资产。
+
 包内结构：
 
 ```text
