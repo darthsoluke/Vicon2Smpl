@@ -9,4 +9,4 @@ ezc3d            # optional: read .c3d files exported from Nexus / Shogun
 # The viewer itself can live in a separate env:  pip install aitviewer && python -m aitviewer.server
 # Vicon DataStream SDK python package (ships with the SDK, not on PyPI):
 #   pip install "<DataStream SDK>/<platform>/Python/vicon_dssdk"
-py-soma-x        # optional: NVIDIA SOMA body model backend (--model-type soma), Apache-2.0
+# NVIDIA SOMA is optional: install requirements-soma.txt for that backend.

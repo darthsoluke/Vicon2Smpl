@@ -23,6 +23,9 @@ Identity: SOMA's rest shape is (almost) linear in its identity coefficients (<3 
 the native SOMA PCA). The model is linearised around a centre by central finite differences through SOMA itself;
 ``prepare_for(betas)`` re-centres, so a rig built for a calibration's coefficients is exact.
 """
+import hashlib
+import json
+
 import numpy as np
 from scipy import sparse
 
@@ -33,6 +36,43 @@ SOMA_LODS = ("mid", "low", "xlo")
 TORSO_NAMES = ("Hips", "Spine1", "Spine2", "Chest")
 # Joints whose static-pose angle varies most between people (lower confidence in static-pose priors).
 _LOW_CONFIDENCE_PARTS = ("Shoulder", "Arm", "Hand", "Jaw", "Eye", "End")
+_NATIVE_CONFIG = dict(soma_native_config="legacy78_lbs", soma_enable_procedural_transforms=False,
+                      soma_apply_correctives=False, soma_correctives_model_loaded=False)
+_RIG_FINGERPRINT_SCHEMA = "soma_legacy78_static_rig_v1"
+_RIG_FINGERPRINT_SCOPE = (
+    "Initial static weights, parents, faces, public T-pose orientations and joint names; "
+    "excludes identity-dependent vertices/joints/bind transforms and external asset files"
+)
+
+
+def _rig_fingerprint(weights, parents, faces, t_pose_orient, joint_names):
+    """Hash the identity-independent rig, not a fitted identity or an asset bundle.
+
+    Canonical byte order/dtypes also avoid hashing float64 SVD projection noise
+    in ``nearest_rotation`` when comparing CPU/platform implementations.
+    """
+    digest = hashlib.sha256(_RIG_FINGERPRINT_SCHEMA.encode("ascii"))
+    for name, value, dtype in (("weights", weights, "<f4"), ("parents", parents, "<i8"),
+                               ("faces", faces, "<i8"), ("t_pose_orient", t_pose_orient, "<f4")):
+        array = np.ascontiguousarray(value, dtype=np.dtype(dtype))
+        header = json.dumps([name, dtype, list(array.shape)], separators=(",", ":")).encode("ascii")
+        digest.update(header)
+        digest.update(memoryview(array).cast("B"))
+    digest.update(json.dumps(list(joint_names), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _soma_package_version():
+    import soma
+
+    version = str(getattr(soma, "__version__", "") or "")
+    if not version:
+        from importlib.metadata import PackageNotFoundError, version as distribution_version
+        try:
+            version = distribution_version("py-soma-x")
+        except PackageNotFoundError:
+            pass
+    return version
 
 
 def nearest_rotation(R):
@@ -49,6 +89,10 @@ class SomaBodyModel(BodyModel):
     def __init__(self, layer, num_betas=10, identity_model_type="soma", lod="mid", data_root=None, fd_step=0.5):
         import torch
 
+        if getattr(layer, "procedural_transforms_enabled", False):
+            raise ValueError("SomaBodyModel requires enable_procedural_transforms=False (legacy78_lbs)")
+        if getattr(layer, "correctives_model", None) is not None:
+            raise ValueError("SomaBodyModel requires correctives_model_path=None")
         self.layer = layer
         self.identity_model_type = identity_model_type
         self.lod = lod
@@ -65,7 +109,8 @@ class SomaBodyModel(BodyModel):
             layer.prepare_identity(torch.zeros(1, self.num_identity_total))
             view = layer.public_rig_view()
             weights = view.skinning_weights.detach().double().cpu().numpy()
-            self._orient = nearest_rotation(view.t_pose_world.detach().double().cpu().numpy()[1:, :3, :3])  # O
+            t_pose_orient = view.t_pose_world.detach().double().cpu().numpy()[1:, :3, :3]
+            self._orient = nearest_rotation(t_pose_orient)  # O
         if np.abs(weights[:, 0]).max() > 1e-8:
             raise ValueError("SOMA virtual Root carries skinning weight; it cannot be dropped")
         parents = np.concatenate([[-1], parents_public[2:] - 1])
@@ -75,6 +120,8 @@ class SomaBodyModel(BodyModel):
         super().__init__(np.zeros((V, 3)), np.zeros((V, 3, num_betas)), None, None, weights[:, 1:], parents, faces,
                          model_type="soma", J_template=np.zeros((J, 3)), J_shapedirs=np.zeros((J, 3, num_betas)))
         self.joint_names = names[1:]
+        self._rig_fingerprint_sha256 = _rig_fingerprint(weights[:, 1:], parents, faces,
+                                                        t_pose_orient, self.joint_names)
         index = {n: i for i, n in enumerate(self.joint_names)}
         self.torso_joints = tuple(index[n] for n in TORSO_NAMES)
         self.head_joint = index["Head"]
@@ -188,16 +235,21 @@ class SomaBodyModel(BodyModel):
                          for name in self.joint_names[1:]])
 
     def calibration_metadata(self):
-        import soma
-
         return dict(soma_identity_model=self.identity_model_type, soma_lod=self.lod,
                     soma_num_identity_total=self.num_identity_total, soma_joint_names=np.array(self.joint_names),
-                    soma_version=str(getattr(soma, "__version__", "")),
+                    soma_version=_soma_package_version(), **_NATIVE_CONFIG,
+                    soma_rig_fingerprint_sha256=self._rig_fingerprint_sha256,
+                    soma_rig_fingerprint_schema=_RIG_FINGERPRINT_SCHEMA,
+                    soma_rig_fingerprint_scope=_RIG_FINGERPRINT_SCOPE,
                     pose_convention="solver poses are bind-relative; public SOMA poses via SomaBodyModel.public_pose")
 
     def recording_metadata(self, betas):
         return dict(identity_coeffs=self._full_coeffs(betas), identity_model_type=self.identity_model_type,
                     soma_lod=self.lod, soma_joint_names=np.array(self.joint_names),
+                    soma_version=_soma_package_version(), **_NATIVE_CONFIG,
+                    soma_rig_fingerprint_sha256=self._rig_fingerprint_sha256,
+                    soma_rig_fingerprint_schema=_RIG_FINGERPRINT_SCHEMA,
+                    soma_rig_fingerprint_scope=_RIG_FINGERPRINT_SCOPE,
                     pose_convention="SOMALayer(enable_procedural_transforms=False).prepare_identity(identity_coeffs[None]); "
                                     "pose(poses.reshape(-1,77,3), transl=trans, apply_correctives=False); "
                                     "poses are relative to the T-pose joint orient, trans is the Hips position (m)")
@@ -211,7 +263,12 @@ class SomaBodyModel(BodyModel):
 
 
 def check_calibration_model(model, calib):
-    """Refuse to pair a SOMA calibration with a differently configured model (or vice versa)."""
+    """Refuse incompatible SOMA configurations; report legacy fields as unverified.
+
+    A static rig fingerprint does not verify all external assets. The return
+    value is a compatibility receipt, not geometric or visual acceptance.
+    Non-SOMA callers retain the previous no-op/None behaviour.
+    """
     is_soma = isinstance(model, SomaBodyModel)
     calib_soma = "soma_lod" in calib
     if is_soma != calib_soma:
@@ -222,3 +279,43 @@ def check_calibration_model(model, calib):
                              f"the loaded model uses lod={model.lod} identity={model.identity_model_type}")
         if len(np.asarray(calib["betas"])) != model.num_betas:
             raise ValueError("Calibration identity coefficient count differs from the loaded SOMA model")
+        verified = ["soma_lod", "soma_identity_model", "num_betas"]
+        missing = []
+
+        def scalar(key):
+            value = np.asarray(calib[key])
+            if value.shape != ():
+                raise ValueError(f"SOMA calibration {key} must be a scalar")
+            return value.item()
+
+        if "soma_joint_names" not in calib:
+            missing.append("soma_joint_names")
+        elif not np.array_equal(np.asarray(calib["soma_joint_names"]), np.asarray(model.joint_names)):
+            raise ValueError("SOMA calibration joint names/order differ from the loaded model")
+        else:
+            verified.append("soma_joint_names")
+
+        current_version = _soma_package_version()
+        if "soma_version" not in calib or not scalar("soma_version"):
+            missing.append("soma_version")
+        elif not current_version or scalar("soma_version") != current_version:
+            raise ValueError(f"SOMA calibration package version {scalar('soma_version')!r} "
+                             f"differs from loaded version {current_version!r}")
+        else:
+            verified.append("soma_version")
+
+        expected = dict(_NATIVE_CONFIG, soma_rig_fingerprint_sha256=model._rig_fingerprint_sha256,
+                        soma_rig_fingerprint_schema=_RIG_FINGERPRINT_SCHEMA)
+        for key, value in expected.items():
+            if key not in calib:
+                missing.append(key)
+                continue
+            saved = scalar(key)
+            if isinstance(value, bool) and not isinstance(saved, bool):
+                raise ValueError(f"SOMA calibration {key} must be a boolean")
+            if saved != value:
+                raise ValueError(f"SOMA calibration {key}={saved!r} differs from loaded model {value!r}")
+            verified.append(key)
+        return dict(status="LEGACY_PARTIAL" if missing else "PASS", verified_fields=verified,
+                    unverified_fields=missing, external_asset_files_verified=False,
+                    rig_fingerprint_scope=_RIG_FINGERPRINT_SCOPE)

@@ -395,13 +395,32 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
         anchor = 0 if tpose[0] <= sel[0] < tpose[1] else None
         if verbose:
             print(f"    anchor frame: {sel[0] if anchor is not None else None}")
-        betas, offsets, _, _, per_marker = refine(model, vids, offsets, betas, pos[sel], valid[sel], Rs[sel], ts[sel],
+        betas, offsets, refined_Rs, refined_ts, per_marker = refine(model, vids, offsets, betas, pos[sel], valid[sel], Rs[sel], ts[sel],
                                                   marker_radius, anchor=anchor, verbose=verbose, anchor_pose=anchor_pose,
                                                   **(refine_kw or {}))
         if map_vids is None:
             vids, offsets = reassign(model, vids, offsets, betas, marker_radius, regions=regions)
 
     model.prepare_for(betas)
+    final_diagnostics = {}
+    if model.model_type == "soma":
+        # Refinement used a local linearisation of the identity. Report the
+        # geometry and bindings that will actually be loaded from this file,
+        # including the last correspondence update, at the refined poses.
+        linearised_rms = np.asarray(per_marker).copy()
+        final_rig = MarkerRig(model, names, vids, offsets, betas)
+        prediction = np.stack([final_rig.forward(R, t) for R, t in zip(refined_Rs, refined_ts)])
+        mask = valid[sel]
+        residual = np.where(mask[..., None], prediction - pos[sel], 0.)
+        squared_error = (residual ** 2).sum(-1).sum(0)
+        counts = mask.sum(0)
+        per_marker = np.full(M, np.nan)
+        np.sqrt(np.divide(squared_error, counts, out=np.zeros(M), where=counts > 0),
+                out=per_marker, where=counts > 0)
+        final_diagnostics = dict(linearised_refine_per_marker_rms=linearised_rms,
+                                 per_marker_rms_stage="exact_final_identity_and_binding_at_refined_poses",
+                                 per_marker_rms_evaluation_frames=sel.copy(),
+                                 per_marker_rms_valid_counts=counts)
     bad = per_marker > 0.015
     if bad.any():
         print(f"[calib] WARNING: high residual markers (check labels/placement): "
@@ -409,4 +428,4 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     return {"marker_names": np.array(names), "vertex_ids": vids, "offsets": offsets, "betas": betas,
             "marker_radius": marker_radius, "per_marker_rms": per_marker, "static_pose": static_pose,
             "static_reference_pose": reference, "initial_static_fit_pose": np.concatenate([fit["root"][None], fit["body"]]),
-            **model.calibration_metadata()}
+            **model.calibration_metadata(), **final_diagnostics}

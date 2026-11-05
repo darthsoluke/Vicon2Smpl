@@ -1,6 +1,6 @@
 # SOMA 后端
 
-`--model-type soma` 用 NVIDIA 的 [SOMA](https://github.com/NVlabs/SOMA-X)（`pip install py-soma-x`，Apache-2.0）作为人体模型，
+`--model-type soma` 用 NVIDIA 的 [SOMA](https://github.com/NVlabs/SOMA-X)（`pip install -r requirements-soma.txt`，Apache-2.0）作为人体模型，
 实时输出 **SOMA 自己的参数**：77 个关节的局部旋转（相对 T-pose 关节朝向，`SOMALayer.pose` 的约定）、Hips 位置和
 身份系数（默认 SOMA 原生 128 维 PCA 的前 `num_betas` 维）。原生 SOMA 身份不需要 SMPL 授权文件。
 
