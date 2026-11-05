@@ -42,7 +42,11 @@ class FieldApp:
         self.finger_marker_mask = None
         self.view_mode = "body"
         self.fit_count = 0
-        self.model = BodyModel.load(args.model_path, args.model_type, args.gender)
+        soma_kw = dict(soma_lod=getattr(args, "soma_lod", "mid"),
+                       soma_identity=getattr(args, "soma_identity", "soma")) if args.model_type == "soma" else {}
+        self.model = BodyModel.load(args.model_path, args.model_type, args.gender, **soma_kw)
+        # Head close-up needs a head joint and a chest joint: native SMPL-X55 (15, 9) or SOMA (named joints).
+        self.head_view = self.model.num_joints == 55 or getattr(self.model, "model_type", None) == "soma"
         self.body_regions = None
         if getattr(args, "body_regions", None):
             regions = json.loads(Path(args.body_regions).read_text())
@@ -98,7 +102,7 @@ class FieldApp:
             if self.fit_hands:
                 self.server.gui.add_button("左手近景").on_click(lambda _: self.show_hand("L"))
                 self.server.gui.add_button("右手近景").on_click(lambda _: self.show_hand("R"))
-            if self.model.num_joints == 55:
+            if self.head_view:
                 self.server.gui.add_button("头部近景").on_click(lambda _: self.show_head())
             self.show_mesh = self.server.gui.add_checkbox("显示人体网格", initial_value=True)
             self.show_mesh.on_update(lambda _: self._mesh_visibility())
@@ -174,7 +178,7 @@ class FieldApp:
             client.camera.up_direction = up
 
     def show_head(self):
-        if self.mode != "tracking" or self.last_result is None or self.model.num_joints != 55:
+        if self.mode != "tracking" or self.last_result is None or not getattr(self, "head_view", False):
             return
         self.view_mode = "head"
         self.cloud.point_size, self.fitted.point_size = .003, .0025
@@ -183,9 +187,11 @@ class FieldApp:
     def update_head_camera(self):
         result = self.last_result
         rw, joints = self.model.fk(result.R, self.rig.J_rest)
-        head = self.rig.v_rest[self.model.weights.argmax(1) == 15].mean(0)
-        target = joints[15] + result.trans + rw[15] @ (head - self.rig.J_rest[15])
-        forward = rw[9, :, 2].copy()
+        hj, chest = getattr(self.model, "head_joint", 15), getattr(self.model, "torso_joints", (9,))[-1]
+        head = self.rig.v_rest[self.model.weights.argmax(1) == hj].mean(0)
+        target = joints[hj] + result.trans + rw[hj] @ (head - self.rig.J_rest[hj])
+        # SMPL rest frames are world-aligned; SOMA's solver rest is its bind pose, whose chest frame is too.
+        forward = rw[chest, :, 2].copy()
         forward[1] = 0
         forward /= max(np.linalg.norm(forward), 1e-9)
         for client in self.server.get_clients().values():
@@ -308,7 +314,9 @@ class FieldApp:
                 "fit_hands": self.sample_fit_hands,
                 "hand_prior_source": self.sample_hand_prior_source if self.sample_fit_hands else None,
                 "hand_prior_sha256": self.sample_hand_prior_sha256 if self.sample_fit_hands else None,
-                "hand_pca_components": self.hand_pca_components if self.sample_fit_hands else None}))
+                "hand_pca_components": self.hand_pca_components if self.sample_fit_hands else None,
+                "soma_lod": getattr(self.args, "soma_lod", "mid"),
+                "soma_identity": getattr(self.args, "soma_identity", "soma")}))
             threading.Thread(target=self._calibrate, daemon=True).start()
 
     def _calibrate(self):
@@ -321,9 +329,10 @@ from vsmpl.body_model import BodyModel
 from vsmpl.calibration import calibrate
 from vsmpl.calibration_input import prepare_calibration_input
 from vsmpl.sources import load_recording
-model=BodyModel.load(sys.argv[1],sys.argv[2],sys.argv[3])
-rec=load_recording(sys.argv[4])
 request=json.loads(Path(sys.argv[5]).read_text())
+soma_kw=dict(soma_lod=request.get('soma_lod','mid'),soma_identity=request.get('soma_identity','soma')) if sys.argv[2]=='soma' else {}
+model=BodyModel.load(sys.argv[1],sys.argv[2],sys.argv[3],**soma_kw)
+rec=load_recording(sys.argv[4])
 assert request['source_subject']==sys.argv[8], 'Calibration subject association changed'
 region_file=Path(sys.argv[5]).parent/request['body_regions_file'] if request['body_regions_file'] else None
 regions=json.loads(region_file.read_text()) if region_file else None
@@ -348,7 +357,7 @@ scope='body_wrist_only' if regions is not None else 'all_markers'
 if fit_hands:
     from vsmpl.full_calibration import calibrate_hands
     body_saved=dict(body_result)
-    body_saved.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,
+    body_saved.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=getattr(model,'num_betas',10),
                       source_subject=request['source_subject'],marker_scope='body_wrist_only')
     np.savez(Path(sys.argv[6]).with_name('body_calib.npz'),**body_saved)
     clock_path=Path(sys.argv[5]).parent/'sampling_clock.npz'
@@ -370,7 +379,7 @@ if fit_hands:
         json.dumps(report,ensure_ascii=False,indent=2,allow_nan=False,default=json_value))
     result.update(hand_prior_source=str(prior_path),hand_prior_sha256=prior_sha)
     scope='body_hands'
-result.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=10,source_subject=request['source_subject'],
+result.update(model_type=sys.argv[2],gender=sys.argv[3],num_betas=getattr(model,'num_betas',10),source_subject=request['source_subject'],
 marker_scope=scope,marker_regions_sha256=hashlib.sha256(region_file.read_bytes()).hexdigest() if region_file else '',
 excluded_marker_names=np.array([n for n in all_names if n not in set(map(str,result['marker_names']))],dtype=str))
 np.savez(sys.argv[6],**result)
@@ -399,6 +408,9 @@ np.savez(sys.argv[6],**result)
 
     def _load_calibration(self, path):
         with np.load(path, allow_pickle=False) as calib:
+            if getattr(self.model, "model_type", None) == "soma" or ("model_type" in calib and str(calib["model_type"]) == "soma"):
+                from vsmpl.soma_model import check_calibration_model
+                check_calibration_model(self.model, calib)
             rig = MarkerRig.from_calibration(self.model, calib)
             residual = calib["per_marker_rms"] * 1000
             scope = str(calib["marker_scope"]) if "marker_scope" in calib else "all_markers"
@@ -463,7 +475,7 @@ np.savez(sys.argv[6],**result)
                 return
             self.solver.reset()
             self.recorder = SequenceRecorder(self.args.model_type, self.args.gender, self.rig.betas,
-                                             self.source.frame_rate)
+                                             self.source.frame_rate, model=self.model)
             self.fit_count = 0
             self.last_result = None
             self.last_observation = None
@@ -578,7 +590,8 @@ np.savez(sys.argv[6],**result)
                                        solver_status=self.last_result.status if self.mode == "tracking" and self.last_result else None)
                         if self.mode == "tracking" and self.last_result is not None:
                             rw, _ = self.model.fk(self.last_result.R, self.rig.J_rest)
-                            receipt["head_world_up_tilt_degrees"] = float(np.degrees(np.arccos(np.clip(rw[15, 1, 1], -1., 1.))))
+                            hj = getattr(self.model, "head_joint", 15)
+                            receipt["head_world_up_tilt_degrees"] = float(np.degrees(np.arccos(np.clip(rw[hj, 1, 1], -1., 1.))))
                         target = self.root / "status.json"
                         temp = target.with_suffix(".tmp")
                         temp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2))
@@ -596,7 +609,11 @@ def main():
     parser.add_argument("--source", required=True, help="Shogun full subject DataStream, normally host:801 or host:8802")
     parser.add_argument("--native-reader", required=True)
     parser.add_argument("--model-path", required=True)
-    parser.add_argument("--model-type", default="smplx", choices=("smpl", "smplh", "smplx"))
+    parser.add_argument("--model-type", default="smplx", choices=("smpl", "smplh", "smplx", "soma"),
+                        help="soma = NVIDIA SOMA (py-soma-x); --model-path is then the SOMA asset folder or 'hf'")
+    parser.add_argument("--soma-lod", default="mid", choices=("mid", "low", "xlo"), help="SOMA mesh level of detail")
+    parser.add_argument("--soma-identity", default="soma", choices=("soma", "smpl", "smplx"),
+                        help="SOMA identity backend (native SOMA PCA by default)")
     parser.add_argument("--gender", default="neutral")
     parser.add_argument("--bind", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8792)

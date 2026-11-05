@@ -52,6 +52,21 @@ def tpose_average(pos, valid, start, end, min_frac=0.5):
     return avg, ok
 
 
+def static_prior_weights(model, arm_w=0.1):
+    """Per-joint confidence (joints 1..J-1) that the static pose matches its reference; a backend with its own
+    skeleton (SOMA) provides `static_prior_weights`, SMPL-family models use the joint numbering below."""
+    if hasattr(model, "static_prior_weights"):
+        return model.static_prior_weights(arm_w)
+    return tpose_joint_weights(model.num_joints, arm_w)
+
+
+def model_static_reference(model, static_pose="t", arm_angle_deg=45.0):
+    """Static reference pose in the model's solver convention (axis-angle, (J,3))."""
+    if hasattr(model, "static_reference_pose"):
+        return model.static_reference_pose(static_pose, arm_angle_deg)
+    return static_reference_pose(model.num_joints, static_pose, arm_angle_deg)
+
+
 def tpose_joint_weights(J, arm_w=0.1):
     """Confidence that a joint is at its rest angle in a T-pose (joints 1..J-1). Arms vary more between people."""
     w = np.ones(J - 1)
@@ -87,7 +102,7 @@ def fit_tpose(model: BodyModel, obs, ok, yaw, marker_radius=0.0095, iters=400, v
             mask[i, indices] = True
         allowed = torch.as_tensor(mask[ok])
     # per-joint prior: arms (collar..hand, joints 13+ except head) may deviate from a perfect T-pose
-    body_w = torch.tensor(tpose_joint_weights(J, 0.05))[:, None]
+    body_w = torch.tensor(static_prior_weights(model, 0.05))[:, None]
 
     def loss_fn(stage):
         R = batch_rodrigues(torch.cat([root[None], body], 0))[None]
@@ -173,14 +188,14 @@ def refine(model, vids, offsets, betas, frames_obs, frames_valid, Rs, ts, marker
     tb = TorchBody(model)
     vid_t = torch.as_tensor(vids)
     W = tb.weights[vid_t]
-    PD = tb.posedirs[:, vid_t]
+    PD = tb.posedirs_at(vid_t)
     obs = torch.tensor(np.nan_to_num(frames_obs))
     val = torch.tensor(frames_valid, dtype=torch.float64)
     b = torch.tensor(betas, requires_grad=True)
     off = torch.tensor(offsets, requires_grad=True)
     aa = torch.tensor(log_so3(Rs), requires_grad=True)  # (F,J,3)
     tr = torch.tensor(ts, requires_grad=True)
-    anchor_w = torch.tensor(tpose_joint_weights(model.num_joints))[:, None]
+    anchor_w = torch.tensor(static_prior_weights(model))[:, None]
     anchor_R = None if anchor_pose is None else batch_rodrigues(torch.tensor(
         np.asarray(anchor_pose)[1:], dtype=torch.float64))
 
@@ -247,7 +262,7 @@ def inverse_skin_reassign(model, rig, pos, valid, Rs, ts, frames, marker_radius,
         TR = np.einsum("mj,fjab->fmab", W, Rws)
         Tt = np.einsum("mj,fja->fma", W, Ats)
         q = np.linalg.solve(TR, (np.nan_to_num(obs) - Tt)[..., None])[..., 0]  # (F,M,3)
-        q -= np.einsum("fp,pmc->fmc", pfs, model.posedirs[:, vids])
+        q -= np.einsum("fp,pmc->fmc", pfs, model.posedirs_at(vids))
         for m in range(M):
             qm = q[val[:, m], m]
             if len(qm):
@@ -295,7 +310,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
 
     # ---- A
     obs0, ok0 = tpose_average(pos, valid, *tpose)
-    reference = static_reference_pose(model.num_joints, static_pose, arm_angle_deg)
+    reference = model_static_reference(model, static_pose, arm_angle_deg)
     print(f"[calib] {static_pose.upper()}-pose window frames {tpose[0]}-{tpose[1]}: {ok0.sum()}/{M} markers usable")
     map_vids = None
     if marker_map:
@@ -353,6 +368,8 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     # ---- B
     vids, offsets, betas, dist = init_from_fit(fit)
     anchor_pose = np.concatenate([np.zeros((1, 3)), fit["body"]]) if static_pose == "a" else None
+    if anchor_pose is None and not model.rest_is_tpose:
+        anchor_pose = reference  # the model's rest pose is not a T-pose (SOMA binds in an A-pose)
     if dist is not None and (dist > 0.04).any():
         print(f"[calib] WARNING: markers far from the fitted surface: "
               f"{[(n, round(float(x) * 1000)) for n, x in zip(names, dist) if x > 0.04]} mm")
@@ -361,6 +378,7 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
     tp_mid = (tpose[0] + tpose[1]) // 2
     per_marker = None
     for rd in range(rounds):
+        model.prepare_for(betas)  # SOMA: re-linearise the identity model at the current shape (no-op for SMPL)
         rig = MarkerRig(model, names, vids, offsets, betas)
         print(f"[calib] round {rd + 1}/{rounds}: tracking {len(pos)} frames ...")
         Rs, ts, rmse, clean = track_take(rig, pos, valid, start=0)
@@ -383,10 +401,12 @@ def calibrate(model, rec, tpose=(0, 100), facing="auto", marker_map=None, marker
         if map_vids is None:
             vids, offsets = reassign(model, vids, offsets, betas, marker_radius, regions=regions)
 
+    model.prepare_for(betas)
     bad = per_marker > 0.015
     if bad.any():
         print(f"[calib] WARNING: high residual markers (check labels/placement): "
               f"{[(n, round(float(r) * 1000, 1)) for n, r, b in zip(names, per_marker, bad) if b]} mm")
     return {"marker_names": np.array(names), "vertex_ids": vids, "offsets": offsets, "betas": betas,
             "marker_radius": marker_radius, "per_marker_rms": per_marker, "static_pose": static_pose,
-            "static_reference_pose": reference, "initial_static_fit_pose": np.concatenate([fit["root"][None], fit["body"]])}
+            "static_reference_pose": reference, "initial_static_fit_pose": np.concatenate([fit["root"][None], fit["body"]]),
+            **model.calibration_metadata()}

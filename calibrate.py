@@ -18,8 +18,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rec", required=True, help=".npz (record.py) or .c3d")
     ap.add_argument("--up-axis", default="z", choices=["z", "y"], help="up axis of a .c3d file")
-    ap.add_argument("--model-path", required=True, help="folder containing smpl/ smplx/ ... model files")
-    ap.add_argument("--model-type", default="smpl", choices=["smpl", "smplh", "smplx"])
+    ap.add_argument("--model-path", required=True, help="folder containing smpl/ smplx/ ... model files; "
+                    "for --model-type soma: SOMA asset folder, or 'hf' for the HuggingFace cache")
+    ap.add_argument("--model-type", default="smpl", choices=["smpl", "smplh", "smplx", "soma"])
+    ap.add_argument("--soma-lod", default="mid", choices=["mid", "low", "xlo"], help="SOMA mesh level of detail")
+    ap.add_argument("--soma-identity", default="soma", choices=["soma", "smpl", "smplx"],
+                    help="SOMA identity backend: native SOMA PCA (default) or licensed SMPL/SMPL-X betas")
     ap.add_argument("--gender", default="neutral")
     ap.add_argument("--num-betas", type=int, default=10)
     ap.add_argument("--tpose", default="0:1.0", help="static T-pose window in seconds, e.g. 0.5:2.5")
@@ -42,7 +46,8 @@ def main():
     tpose = (int(a * fps), max(int(b * fps), int(a * fps) + 1))
     print(f"[calib] {len(rec['pos'])} frames @ {fps:.0f} Hz, {len(rec['names'])} markers")
 
-    model = BodyModel.load(args.model_path, args.model_type, args.gender, args.num_betas)
+    model = BodyModel.load(args.model_path, args.model_type, args.gender, args.num_betas,
+                           soma_lod=args.soma_lod, soma_identity=args.soma_identity)
     res = calibrate(model, rec, tpose=tpose, facing=args.facing, marker_map=args.marker_map,
                     marker_radius=args.marker_radius, n_frames=args.n_frames, rounds=args.rounds,
                     static_pose=args.static_pose, arm_angle_deg=args.arm_angle, marker_regions=args.marker_regions)

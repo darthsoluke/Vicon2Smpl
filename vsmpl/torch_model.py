@@ -23,8 +23,10 @@ class TorchBody:
         self.m = model
         self.v_template = f(model.v_template)
         self.shapedirs = f(model.shapedirs)
-        self.posedirs = f(model.posedirs)
-        self.J_regressor = f(model.J_regressor)
+        self.posedirs = None if model.posedirs is None else f(model.posedirs)
+        self.J_regressor = None if model.J_regressor is None else f(model.J_regressor)
+        self.J_template = None if model.J_template is None else f(model.J_template)
+        self.J_shapedirs = None if model.J_shapedirs is None else f(model.J_shapedirs)
         self.weights = f(model.weights)
         self.parents = model.parents.tolist()
         self.faces = torch.as_tensor(model.faces, device=device)
@@ -32,7 +34,13 @@ class TorchBody:
 
     def shaped(self, betas):
         v = self.v_template + torch.einsum("vcb,b->vc", self.shapedirs, betas)
+        if self.J_regressor is None:
+            return v, self.J_template + torch.einsum("jcb,b->jc", self.J_shapedirs, betas)
         return v, self.J_regressor @ v
+
+    def posedirs_at(self, vertex_ids):
+        """(P,N,3) pose blendshapes of selected vertices, or None for a model without correctives."""
+        return None if self.posedirs is None else self.posedirs[:, vertex_ids]
 
     def vertex_normals(self, v):
         f = self.faces
@@ -52,9 +60,12 @@ class TorchBody:
     def skin(self, R, trans, pts_rest, W, PD, J_rest):
         """Skin arbitrary rest-space points. R (F,J,3,3), trans (F,3), pts_rest (N,3), W (N,J), PD (P,N,3)."""
         Rw, c = self.fk(R, J_rest)
-        eye = torch.eye(3, dtype=R.dtype, device=R.device)
-        pf = (R[:, 1:] - eye).reshape(R.shape[0], -1)
-        p = pts_rest[None] + torch.einsum("fp,pnc->fnc", pf, PD)
+        if PD is None:
+            p = pts_rest[None].expand(R.shape[0], -1, -1)
+        else:
+            eye = torch.eye(3, dtype=R.dtype, device=R.device)
+            pf = (R[:, 1:] - eye).reshape(R.shape[0], -1)
+            p = pts_rest[None] + torch.einsum("fp,pnc->fnc", pf, PD)
         At = c - torch.einsum("fjab,jb->fja", Rw, J_rest)
         TR = torch.einsum("nj,fjab->fnab", W, Rw)
         Tt = torch.einsum("nj,fja->fna", W, At)

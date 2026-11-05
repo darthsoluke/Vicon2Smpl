@@ -2,6 +2,8 @@
 
 从 Vicon 光学动捕的**带标签 marker** 实时求解 SMPL 系列人体，并实时可视化。
 当前现场网页支持原生 **SMPL-X 身体＋双手 72 点**，包含头颈、手腕和手指；也保留 SMPL / SMPL-H 身体路径。
+也可以用 NVIDIA **SOMA** 人体模型（`--model-type soma`，身体＋手腕），直接输出 SOMA 的 77 关节姿态与身份系数，
+原理、用法和限制见 [SOMA 后端](docs/SOMA.md)。
 
 实验室共享部署、精确依赖离线包、单实例启动和健康检查见 [部署说明](docs/DEPLOYMENT.md)。
 4090D 的目录、网页、SSH 与用户服务入口见 [4090D 使用说明](docs/4090D.md)。
@@ -83,7 +85,7 @@ python calibrate.py --rec calib_take.npz --model-path ./body_models --model-type
   指定手臂下垂角的初值；实际关节姿态继续由观测优化。A-pose 的联合标定约束保留已拟合的静止姿态，
   不会把静止帧拉回 T-pose。后续自由活动可用，但未活动到的关节约束可能不足。
 - `--facing`：T-pose 时被试朝向（SMPL 坐标轴：Vicon +X → +x，Vicon +Y → −z）。默认 `auto` 会对多个朝向假设各跟踪 10 秒 ROM、选残差最小的；输出里出现 "ambiguous" 时手动指定。
-- `--marker-map labels.json`：如果你有 `{marker标签: SMPL顶点id}` 的对应表（例如来自 MoSh++/SOMA 的标记布局），可跳过自动对应。
+- `--marker-map labels.json`：如果你有 `{marker标签: SMPL顶点id}` 的对应表（例如来自 MoSh++ 或 MPI 的 SOMA 自动标注方法的标记布局；它与本仓库的 NVIDIA SOMA 人体模型只是重名），可跳过自动对应。
 - `--marker-regions regions.json`：调用方显式提供 `{标签: [允许的顶点id]}`，可在对应身体部位内寻找实际贴点。
   此约束贯穿静止拟合、初次对应和两种重新分配；与固定 `--marker-map` 互斥。区域定义属于调用方先验，
   需要按现场标签和模型核对，不默认把任意名字解释为某个身体部位。
@@ -136,6 +138,9 @@ python tests/test_core.py        # SO(3) 内核一致性、前向（numpy vs tor
 python tests/test_pipeline.py 0 1 2   # 全自动标定 + 新动作跟踪，三个随机种子
 python tests/test_cli.py         # C3D → calibrate.py → run_realtime.py --replay（假 viewer 服务器 + UDP + 保存）
 VSMPL_NO_NUMBA=1 python tests/test_core.py   # 纯 numpy 路径
+python tests/test_soma.py mid    # SOMA 前向与 SOMALayer.pose 逐顶点一致、参数往返、身份线性化
+python tests/test_soma_pipeline.py low t 0    # SOMA 人体上的全自动标定 + 新动作跟踪（经 SOMALayer 评估）
+python tests/test_soma_cli.py low             # SOMA：calibrate.py → run_realtime.py --replay → 保存/UDP
 ```
 
 ## 目录
@@ -154,7 +159,9 @@ vsmpl/
   outputs.py         UDP 与 AMASS 格式保存
   rotations.py       SO(3) 工具
   _kernels.py        可选 numba 内核
-tests/               合成人体与测试
+  soma_model.py      SOMA 后端：绑定相对参数化、身份线性化、SOMA 公共参数换算
+scripts/convert_regions_to_soma.py   SMPL-X 区域文件 → SOMA 顶点编号
+tests/               合成人体与测试（test_soma*.py 需要 py-soma-x）
 ```
 
 SMPL / SMPL-X 模型及其衍生数据受各自许可证约束，请勿提交到仓库（`.gitignore` 已排除 `body_models/`、`*.pkl`、`*.npz`）。
